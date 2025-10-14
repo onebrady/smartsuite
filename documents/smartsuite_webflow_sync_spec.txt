@@ -1,0 +1,5655 @@
+# SmartSuite ↔ Webflow Sync Admin – Comprehensive Build Specification v2.0
+
+**For**: Claude Code Implementation  
+**Owner**: Brady  
+**Date**: 2025-10-13  
+**Purpose**: Complete technical specification for production-ready synchronization system
+
+---
+
+## Table of Contents
+
+1. [Product Overview](#1-product-overview)
+2. [System Architecture](#2-system-architecture)
+3. [Technology Stack & Dependencies](#3-technology-stack--dependencies)
+4. [Environment Configuration](#4-environment-configuration)
+5. [Database Schema](#5-database-schema)
+6. [External API Integration Details](#6-external-api-integration-details)
+7. [Security Implementation](#7-security-implementation)
+8. [Core Business Logic](#8-core-business-logic)
+9. [Queue & Worker System](#9-queue--worker-system)
+10. [Mapping Engine Specification](#10-mapping-engine-specification)
+11. [Dashboard UI Requirements](#11-dashboard-ui-requirements)
+12. [API Endpoints Specification](#12-api-endpoints-specification)
+13. [Error Handling Strategy](#13-error-handling-strategy)
+14. [Logging & Monitoring](#14-logging--monitoring)
+15. [Testing Requirements](#15-testing-requirements)
+16. [Deployment Instructions](#16-deployment-instructions)
+17. [Implementation Checklist](#17-implementation-checklist)
+18. [Edge Cases & Special Scenarios](#18-edge-cases--special-scenarios)
+
+---
+
+## 1) Product Overview
+
+### 1.1 Problem Statement
+Users need to synchronize data from SmartSuite (project management/database tool) to Webflow CMS (website content management) in real-time. Manual updates are time-consuming and error-prone. The system must handle:
+- Real-time webhook triggers from SmartSuite
+- Complex field type mappings (text, numbers, dates, references, files)
+- Rate limiting from Webflow API (60 req/min per token)
+- Retry logic for transient failures
+- Idempotent operations (duplicate webhooks)
+- Secure credential storage
+- Comprehensive audit trail
+
+### 1.2 Success Criteria
+- **Reliability**: 99.9% successful sync rate
+- **Latency**: <5 seconds p95 from webhook to Webflow publish
+- **Security**: Zero credential exposure; all tokens encrypted at rest
+- **Observability**: Complete event history with replay capability
+- **Usability**: Non-technical users can configure mappings via UI
+- **Scalability**: Handle 10,000+ items per connection, 100+ events/minute
+
+### 1.3 Core Features
+
+#### Phase 1 (MVP - All In Scope)
+1. **Connection Management**
+   - Store encrypted SmartSuite API keys and Webflow PATs per connection
+   - Auto-discovery of available fields from both systems
+   - Generate unique webhook URLs with secure secrets
+   - Health monitoring (last success, consecutive errors)
+
+2. **Field Mapping Wizard**
+   - Visual interface to map SmartSuite fields → Webflow fields
+   - Type compatibility checking (e.g., SmartSuite "text" → Webflow "PlainText")
+   - Support for direct mappings, JSONata expressions, and templates
+   - Live preview using sample data
+   - Slug generation with templates (e.g., `{{sku}}-{{kebab(name)}}`)
+
+3. **Real-Time Sync Engine**
+   - Webhook ingress with signature verification
+   - Idempotency via unique keys (prevent duplicate processing)
+   - Queue-based processing with per-connection rate limiting
+   - Automatic retry with exponential backoff
+   - Dead letter queue for permanent failures
+
+4. **Event Management**
+   - Events inbox showing all webhook triggers
+   - Status tracking (queued, processing, success, failed, dead_letter)
+   - Detailed error messages with stack traces
+   - Manual replay capability
+   - Search and filter by status, date, external ID
+
+5. **Item Inspector**
+   - View any Webflow item by external ID lookup
+   - Show sync history and current state
+   - Manual resync button
+   - Diff view (show what changed between syncs)
+
+6. **Analytics Dashboard**
+   - Volume metrics (total, success, failed counts)
+   - Latency metrics (p50, p95, p99)
+   - Error analysis (most common errors)
+   - Time-series graphs (last 24h, 7d, 30d)
+   - Per-connection breakdowns
+
+### 1.4 Non-Goals (Explicitly Out of Scope)
+- Bi-directional sync (Webflow → SmartSuite)
+- Real-time collaboration features
+- Custom integrations beyond SmartSuite ↔ Webflow
+- Multi-tenant SaaS (single deployment per user/team)
+
+---
+
+## 2) System Architecture
+
+### 2.1 High-Level Architecture Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         SmartSuite                              │
+│                     (External System)                           │
+│  - User updates record in table                                 │
+│  - SmartSuite fires webhook                                     │
+└────────────────┬────────────────────────────────────────────────┘
+                 │
+                 │ POST /api/hooks/[connectionId]
+                 │ Headers:
+                 │   x-smartsuite-signature: sha256=...
+                 │   x-smartsuite-timestamp: 1697200000
+                 │ Body: { event_type, record_id, data: {...} }
+                 │
+                 ↓
+┌─────────────────────────────────────────────────────────────────┐
+│                    Webhook Ingress Layer                        │
+│  /app/api/hooks/[connectionId]/route.ts                         │
+│                                                                  │
+│  Step 1: Lookup connection from [connectionId] param            │
+│  Step 2: Verify x-smartsuite-signature using HMAC-SHA256       │
+│  Step 3: Verify x-smartsuite-timestamp (prevent replay)        │
+│  Step 4: Check idempotency key (x-idempotency-key or hash)     │
+│  Step 5: Insert Event record (status: queued)                  │
+│  Step 6: Return 202 Accepted immediately                       │
+│                                                                  │
+│  Error Handling:                                                │
+│  - 404 if connection not found                                 │
+│  - 401 if signature invalid                                    │
+│  - 409 if duplicate idempotency key (return existing event)    │
+└────────────────┬────────────────────────────────────────────────┘
+                 │
+                 │ Event stored in PostgreSQL
+                 ↓
+┌─────────────────────────────────────────────────────────────────┐
+│                      Event Queue (Database)                     │
+│  Table: events                                                  │
+│  Columns:                                                       │
+│    - id (PK)                                                    │
+│    - connectionId (FK)                                          │
+│    - status (queued|processing|success|failed|dead_letter)     │
+│    - payload (JSON)                                             │
+│    - attempts (INT)                                             │
+│    - retryAfter (TIMESTAMP - for backoff)                      │
+│    - queuedAt, processedAt, durationMs                         │
+│    - error, errorStack (for failures)                          │
+│                                                                  │
+│  Indexes:                                                       │
+│    - (connectionId, status, queuedAt) for worker queries       │
+│    - (status, retryAfter) for retry scheduling                 │
+│    - (idempotencyKey) unique for deduplication                 │
+└────────────────┬────────────────────────────────────────────────┘
+                 │
+                 │ Vercel Cron triggers every 1 minute
+                 │ POST /api/jobs/ingest
+                 │ Authorization: Bearer CRON_SECRET
+                 ↓
+┌─────────────────────────────────────────────────────────────────┐
+│                    Worker Process (Ingest)                      │
+│  /app/api/jobs/ingest/route.ts                                 │
+│  Max Duration: 300 seconds (Vercel limit)                      │
+│                                                                  │
+│  Step 1: Verify cron secret                                    │
+│  Step 2: Acquire distributed lock (prevent concurrent runs)    │
+│  Step 3: Query events WHERE status IN (queued, failed)         │
+│           AND (status = queued OR retryAfter <= NOW())         │
+│           ORDER BY queuedAt ASC LIMIT 25                       │
+│  Step 4: For each event, process in parallel:                  │
+│           - Update status = processing, attempts++             │
+│           - Load connection + mapping config                   │
+│           - Decrypt API tokens                                 │
+│           - Normalize payload                                  │
+│           - Apply field mappings                               │
+│           - Validate required fields                           │
+│           - Upsert to Webflow (via rate-limited queue)        │
+│           - Update IdMap (external ID → Webflow item ID)      │
+│           - Update event status (success/failed)              │
+│           - Record metrics (duration, warnings)               │
+│  Step 5: Release lock                                          │
+│  Step 6: Return summary { processed, succeeded, failed }      │
+└────────────────┬────────────────────────────────────────────────┘
+                 │
+                 │ Webflow API calls queued
+                 ↓
+┌─────────────────────────────────────────────────────────────────┐
+│                  Rate-Limited Queue (p-queue)                   │
+│  Per-Connection Queue:                                          │
+│    - interval: 60000ms (1 minute)                              │
+│    - intervalCap: rateLimitPerMin (default 50)                 │
+│    - carryoverConcurrencyCount: true (spread over time)        │
+│    - timeout: 30000ms (30s per task)                           │
+│                                                                  │
+│  Why Per-Connection:                                            │
+│    - Different connections may have different rate limits      │
+│    - Isolate failures (one slow connection doesn't block all)  │
+│    - Better observability (track queue depth per connection)   │
+└────────────────┬────────────────────────────────────────────────┘
+                 │
+                 │ API calls wrapped in p-retry
+                 ↓
+┌─────────────────────────────────────────────────────────────────┐
+│                    Webflow Client Layer                         │
+│  /lib/webflow.ts                                                │
+│                                                                  │
+│  Function: upsertWebflowItem()                                  │
+│  Step 1: Check IdMap for existing Webflow item ID              │
+│  Step 2a: If exists → PATCH /items/{itemId}/live              │
+│  Step 2b: If not exists → POST /items/live                     │
+│  Step 3: Update IdMap with new/existing item ID                │
+│  Step 4: Return { wfItemId, response, warnings }               │
+│                                                                  │
+│  Retry Logic (p-retry):                                         │
+│    - retries: connection.maxRetries (default 5)                │
+│    - minTimeout: connection.retryBackoffMs (default 1000ms)    │
+│    - maxTimeout: env.MAX_RETRY_BACKOFF_MS (default 60000ms)    │
+│    - factor: 2 (exponential)                                   │
+│    - randomize: true (jitter ±30%)                             │
+│    - onFailedAttempt: log attempt number + error               │
+│                                                                  │
+│  Retriable Errors:                                              │
+│    - Network errors (ECONNREFUSED, ETIMEDOUT, socket hang up)  │
+│    - HTTP 429 (rate limit)                                     │
+│    - HTTP 500, 502, 503 (server errors)                        │
+│                                                                  │
+│  Non-Retriable Errors:                                          │
+│    - HTTP 400 (validation error)                               │
+│    - HTTP 401, 403 (auth error)                                │
+│    - HTTP 404 (collection/item not found)                      │
+└────────────────┬────────────────────────────────────────────────┘
+                 │
+                 │ POST /v2/collections/{id}/items/live
+                 │ Authorization: Bearer {wfToken}
+                 │ Body: { fieldData: {...} }
+                 ↓
+┌─────────────────────────────────────────────────────────────────┐
+│                        Webflow API                              │
+│                    (External System)                            │
+│  - Creates or updates CMS item                                  │
+│  - Publishes to live site immediately                           │
+│  - Returns item ID + full item data                             │
+└─────────────────────────────────────────────────────────────────┘
+                 │
+                 │ Success response
+                 ↓
+┌─────────────────────────────────────────────────────────────────┐
+│                      Update Database                            │
+│  1. IdMap table:                                                │
+│     - Upsert (connectionId, externalSource, externalId)        │
+│     - Set wfItemId, wfSlug, lastSyncedAt                       │
+│     - Increment syncCount                                       │
+│  2. Event table:                                                │
+│     - Update status = success                                  │
+│     - Set processedAt, durationMs, wfItemId                    │
+│  3. Connection table:                                           │
+│     - Update lastSuccessAt = NOW()                             │
+│     - Reset consecutiveErrors = 0                              │
+└─────────────────────────────────────────────────────────────────┘
+
+
+┌─────────────────────────────────────────────────────────────────┐
+│                    Dashboard UI (Next.js)                       │
+│  /app/admin/*                                                   │
+│                                                                  │
+│  Pages:                                                         │
+│  1. Overview (/admin)                                           │
+│     - Total events (24h, 7d)                                   │
+│     - Success rate chart                                       │
+│     - Top errors                                               │
+│     - Active connections list                                  │
+│                                                                  │
+│  2. Connections (/admin/connections)                           │
+│     - List all connections (status, last success)              │
+│     - Create new connection button                             │
+│     - Edit/pause/delete actions                                │
+│                                                                  │
+│  3. Connection Detail (/admin/connections/[id])                │
+│     - Configuration summary                                    │
+│     - Field mapping table                                      │
+│     - Recent events for this connection                        │
+│     - Analytics charts (this connection only)                  │
+│     - Test webhook button                                      │
+│                                                                  │
+│  4. Mapping Wizard (/admin/connections/[id]/mapping)          │
+│     - Step 1: Credentials (SmartSuite + Webflow)              │
+│     - Step 2: Select source (base + table)                    │
+│     - Step 3: Select target (site + collection)               │
+│     - Step 4: Auto-map fields (with manual overrides)         │
+│     - Step 5: Configure transforms (slug, status behavior)    │
+│     - Step 6: Test with sample data                           │
+│     - Step 7: Webhook URL + secret                            │
+│                                                                  │
+│  5. Events Inbox (/admin/events)                               │
+│     - Table with filters (status, connection, date range)     │
+│     - Search by external ID                                    │
+│     - Bulk actions (retry selected, mark as dead letter)      │
+│     - Event detail modal (payload, error, timeline)           │
+│                                                                  │
+│  6. Item Inspector (/admin/items)                              │
+│     - Search by external ID or Webflow item ID                │
+│     - Show current Webflow item data                           │
+│     - Show sync history (all events for this item)            │
+│     - Diff view (compare syncs)                                │
+│     - Manual resync button                                     │
+│                                                                  │
+│  Authentication:                                                │
+│  - Password-protected (single admin password)                  │
+│  - iron-session for cookie-based auth                          │
+│  - Session expires after 7 days of inactivity                  │
+│  - CSRF token protection on all mutations                      │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 2.2 Data Flow Scenarios
+
+#### Scenario A: New Item Created in SmartSuite
+```
+1. User creates new product in SmartSuite Products table
+2. SmartSuite fires webhook:
+   POST /api/hooks/{connectionId}
+   { event_type: "record_created", record_id: "ABC123", data: {...} }
+3. System verifies signature, creates Event (status: queued)
+4. Worker picks up event (status: processing)
+5. Mapper transforms SmartSuite data → Webflow format
+6. No IdMap entry exists → POST /items/live (create new)
+7. Webflow returns new item ID "wf_xyz789"
+8. System creates IdMap entry: (ABC123 → wf_xyz789)
+9. Event marked success, duration recorded
+10. Product is now live on Webflow site
+```
+
+#### Scenario B: Existing Item Updated in SmartSuite
+```
+1. User changes price in SmartSuite product (already synced)
+2. Webhook fired with event_type: "record_updated"
+3. Worker processes, finds IdMap entry (ABC123 → wf_xyz789)
+4. PATCH /items/wf_xyz789/live with updated price
+5. IdMap updated (lastSyncedAt, syncCount++)
+6. Event marked success
+```
+
+#### Scenario C: Duplicate Webhook (Idempotency)
+```
+1. SmartSuite fires webhook for record ABC123
+2. Network glitch causes SmartSuite to retry same webhook
+3. First webhook: idempotencyKey = "ss_event_12345"
+   - Creates Event with this key
+4. Second webhook: idempotencyKey = "ss_event_12345"
+   - Query finds existing Event with same key
+   - Return 409 Conflict with existing event ID
+   - No duplicate processing occurs
+```
+
+#### Scenario D: Transient Failure (Retry Success)
+```
+1. Webhook processed, Event queued
+2. Worker attempts to POST to Webflow
+3. Webflow API returns 503 (service unavailable)
+4. p-retry catches error, determines it's retriable
+5. Event marked as failed, retryAfter = now + 1000ms
+6. Worker skips this event for 1 second
+7. Next worker run (1 minute later):
+   - Event retryAfter has passed
+   - Worker retries, Webflow API is back up
+   - POST succeeds, Event marked success
+```
+
+#### Scenario E: Permanent Failure (Dead Letter)
+```
+1. Event processed 5 times (maxRetries = 5)
+2. Each time fails with HTTP 400 (invalid field value)
+3. After 5th attempt, status = dead_letter
+4. Connection.consecutiveErrors incremented
+5. Dashboard shows error in Events Inbox
+6. Admin reviews error message: "Field 'price' must be a number"
+7. Admin fixes mapping to cast string → number
+8. Admin clicks "Replay" button on dead letter event
+9. Event status reset to queued, attempts reset to 0
+10. Worker picks up, succeeds with fixed mapping
+```
+
+### 2.3 Component Responsibilities
+
+| Component | Responsibility | Scalability Notes |
+|-----------|---------------|-------------------|
+| **Webhook Ingress** | Receive, verify, and queue webhooks as fast as possible | Stateless; horizontally scalable; returns 202 immediately |
+| **Event Queue** | Durable storage of all webhook events | PostgreSQL with indexes; can handle millions of rows |
+| **Worker** | Process events, transform data, call Webflow API | Single-instance with distributed lock; can run on cron or continuous |
+| **Rate Limiter** | Prevent exceeding Webflow API limits | In-memory p-queue; persists across same process only |
+| **Mapper** | Transform SmartSuite data → Webflow format | Stateless; deterministic; can be tested in isolation |
+| **Webflow Client** | Handle API calls with retries and error handling | Stateless; wraps HTTP client with retry logic |
+| **Dashboard** | Provide UI for configuration and monitoring | Server-rendered with API routes; no real-time requirements |
+
+### 2.4 Architecture Decisions Rationale
+
+**Decision 1: Use Database as Queue**
+- **Why**: Simplicity, durability, already using PostgreSQL
+- **Trade-off**: Not as fast as Redis/RabbitMQ, but adequate for volume (<1000/min)
+- **Alternative Considered**: QStash (serverless queue) - rejected for MVP due to added complexity
+
+**Decision 2: Single-Instance Worker with Distributed Lock**
+- **Why**: Predictable behavior, easier debugging, adequate for volume
+- **Trade-off**: Not horizontally scalable (but can process 25 events in <5 min)
+- **Alternative Considered**: Multi-worker with job coordination - defer until needed
+
+**Decision 3: Per-Connection Rate Limiting**
+- **Why**: Isolate failures, respect per-token limits, fine-grained control
+- **Trade-off**: More queues in memory (but bounded by connection count)
+- **Alternative Considered**: Global rate limiter - rejected due to blast radius
+
+**Decision 4: Encrypt Credentials at Rest**
+- **Why**: Security best practice, compliance, defense in depth
+- **Trade-off**: Slight performance overhead on encrypt/decrypt
+- **Alternative Considered**: Environment variables only - rejected due to multi-connection needs
+
+**Decision 5: Use Webflow "Live" Endpoints**
+- **Why**: Immediate publish (no separate publish step), simpler UX
+- **Trade-off**: No draft workflow, can't preview before going live
+- **Alternative Considered**: Draft → Publish workflow - rejected for MVP simplicity
+
+---
+
+## 3) Technology Stack & Dependencies
+
+### 3.1 Core Framework
+- **Next.js 14.2+** (App Router)
+  - Reasoning: Unified codebase for API + UI, excellent DX, Vercel-optimized
+  - App Router for modern patterns (Server Components, API routes)
+  - TypeScript for type safety
+
+### 3.2 Database & ORM
+- **PostgreSQL** (via Neon)
+  - Version: 15+
+  - Reasoning: ACID compliance, rich query capabilities, proven at scale
+  - Features needed: JSON columns, full-text search, advisory locks
+- **Prisma 5.15+**
+  - Reasoning: Type-safe queries, migration management, excellent DX
+  - Features needed: Connection pooling, middleware hooks
+
+### 3.3 External APIs
+- **SmartSuite REST API v1**
+  - Base URL: `https://app.smartsuite.com/api/v1`
+  - Auth: Token-based (header: `Authorization: Token {key}`)
+  - Rate Limits: Not publicly documented (assume 60/min to be safe)
+  - Webhook Signature: HMAC-SHA256
+  
+- **Webflow Data API v2**
+  - Base URL: `https://api.webflow.com/v2`
+  - Auth: Bearer token (Personal Access Token)
+  - Rate Limits: 60 requests/minute per token, 10 concurrent
+  - Docs: https://developers.webflow.com/data/reference
+
+### 3.4 Queue & Retry
+- **p-queue 8.0+**
+  - Reasoning: Reliable rate limiting, carryover support, timeout handling
+  - Used for: Per-connection Webflow API rate limiting
+  
+- **p-retry 6.2+**
+  - Reasoning: Exponential backoff, jitter, retry predicate support
+  - Used for: Webflow API calls, transient error handling
+  
+- **p-limit 5.0+**
+  - Reasoning: Concurrency control for batch operations
+  - Used for: Parallel event processing within batch
+
+### 3.5 Data Transformation
+- **jsonata 2.0+**
+  - Reasoning: Declarative JSONPath-like expressions for complex mappings
+  - Example: `$.items[price > 100].{name: title, value: price * 0.9}`
+  
+- **change-case 5.4+**
+  - Reasoning: String case transformations for slug generation
+  - Functions: camelCase, kebabCase, snakeCase, etc.
+  
+- **date-fns 3.6+ and date-fns-tz 3.1+**
+  - Reasoning: Date manipulation, timezone handling
+  - Used for: Date field transformations, analytics date ranges
+
+### 3.6 Security
+- **bcryptjs 2.4+**
+  - Reasoning: Hash admin password, webhook secrets (bcrypt rounds = 10)
+  - Used for: Dashboard auth, webhook secret storage
+  
+- **iron-session 8.0+**
+  - Reasoning: Encrypted cookie-based sessions, no database needed
+  - Used for: Dashboard authentication
+  
+- **nanoid 5.0+**
+  - Reasoning: Generate secure random IDs for CSRF tokens, process IDs
+  - Used for: CSRF protection, distributed lock identifiers
+  
+- **crypto (Node.js built-in)**
+  - Reasoning: AES-256-GCM for credential encryption, HMAC for signatures
+  - Used for: Encrypt/decrypt API tokens, verify webhook signatures
+
+### 3.7 Logging
+- **pino 9.1+ and pino-pretty 11.1+**
+  - Reasoning: Structured JSON logging, low overhead, Vercel-compatible
+  - Configuration:
+    - Production: JSON output (level: info)
+    - Development: Pretty output (level: debug)
+  - Fields to log: timestamp, level, msg, context (connectionId, eventId, etc.)
+
+### 3.8 UI Components
+- **Tailwind CSS 3.4+**
+  - Reasoning: Utility-first, fast iteration, small bundle size
+  - Configuration: Custom color palette, spacing scale
+  
+- **Radix UI Primitives**
+  - Components: Dialog, Select, Tooltip, Tabs, Toast, Switch, DropdownMenu
+  - Reasoning: Accessible, unstyled, composable, SSR-compatible
+  
+- **shadcn/ui** (copy/paste components)
+  - Pre-built components: Button, Input, Label, Card, Badge, Table
+  - Reasoning: Beautiful defaults, easy to customize, no package dependency
+  
+- **TanStack Table 8.17+**
+  - Reasoning: Headless table with sorting, filtering, pagination
+  - Used for: Events inbox, connections list, item inspector
+  
+- **react-hook-form 7.51+ and @hookform/resolvers 3.6+**
+  - Reasoning: Performant forms, validation integration with Zod
+  - Used for: Mapping wizard forms, settings forms
+  
+- **Recharts 2.12+**
+  - Reasoning: Composable React charts, responsive, TypeScript support
+  - Used for: Analytics dashboard (line charts, bar charts)
+  
+- **lucide-react 0.395+**
+  - Reasoning: Beautiful icons, tree-shakeable, active maintenance
+  - Used for: UI icons throughout dashboard
+
+### 3.9 Validation & Types
+- **zod 3.23+**
+  - Reasoning: Runtime type validation, TypeScript integration
+  - Used for: Environment variables, API payloads, form validation
+  
+- **@t3-oss/env-nextjs 0.10+**
+  - Reasoning: Type-safe environment variable validation with Zod
+  - Used for: Validate all env vars at build time
+
+### 3.10 HTTP Client
+- **undici 6.18+** (Node.js native fetch)
+  - Reasoning: Modern fetch API, faster than axios, built into Node 18+
+  - Alternative: Can use native `fetch` in Node 18+
+  - Used for: All external API calls (SmartSuite, Webflow)
+
+### 3.11 Package.json Structure
+
+```json
+{
+  "name": "smartsuite-webflow-sync",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "prisma generate && next build",
+    "start": "next start",
+    "lint": "next lint",
+    "db:push": "prisma db push",
+    "db:migrate": "prisma migrate dev",
+    "db:studio": "prisma studio",
+    "db:seed": "tsx prisma/seed.ts",
+    "type-check": "tsc --noEmit",
+    "test": "vitest",
+    "test:ui": "vitest --ui"
+  },
+  "dependencies": {
+    "next": "^14.2.5",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "typescript": "^5.5.3",
+    
+    "@prisma/client": "^5.15.0",
+    "prisma": "^5.15.0",
+    
+    "zod": "^3.23.8",
+    "@t3-oss/env-nextjs": "^0.10.1",
+    
+    "undici": "^6.18.2",
+    "p-retry": "^6.2.0",
+    "p-queue": "^8.0.1",
+    "p-limit": "^5.0.0",
+    
+    "jsonata": "^2.0.5",
+    "change-case": "^5.4.4",
+    "date-fns": "^3.6.0",
+    "date-fns-tz": "^3.1.3",
+    
+    "iron-session": "^8.0.1",
+    "bcryptjs": "^2.4.3",
+    "nanoid": "^5.0.7",
+    
+    "pino": "^9.1.0",
+    "pino-pretty": "^11.1.0",
+    
+    "@tanstack/react-table": "^8.17.3",
+    "react-hook-form": "^7.51.5",
+    "@hookform/resolvers": "^3.6.0",
+    
+    "@radix-ui/react-dialog": "^1.0.5",
+    "@radix-ui/react-select": "^2.0.0",
+    "@radix-ui/react-tooltip": "^1.0.7",
+    "@radix-ui/react-tabs": "^1.0.4",
+    "@radix-ui/react-toast": "^1.1.5",
+    "@radix-ui/react-switch": "^1.0.3",
+    "@radix-ui/react-dropdown-menu": "^2.0.6",
+    
+    "recharts": "^2.12.7",
+    "clsx": "^2.1.1",
+    "tailwind-merge": "^2.3.0",
+    "lucide-react": "^0.395.0",
+    
+    "class-variance-authority": "^0.7.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.9",
+    "@types/bcryptjs": "^2.4.6",
+    "@types/jsonata": "^1.5.1",
+    
+    "tailwindcss": "^3.4.4",
+    "postcss": "^8.4.38",
+    "autoprefixer": "^10.4.19",
+    
+    "eslint": "^8.57.0",
+    "eslint-config-next": "^14.2.5",
+    "prettier": "^3.3.2",
+    "prettier-plugin-tailwindcss": "^0.6.5",
+    
+    "tsx": "^4.15.7",
+    "vitest": "^1.6.0",
+    "@testing-library/react": "^16.0.0",
+    "@testing-library/jest-dom": "^6.4.6",
+    "@vitejs/plugin-react": "^4.3.1"
+  }
+}
+```
+
+### 3.12 Why Not X?
+
+**Why not Axios instead of undici/fetch?**
+- Native fetch is standard and built into Node 18+
+- undici is Node's official HTTP client (faster than axios)
+- Fetch API is more widely known and documented
+
+**Why not Bull/BullMQ for queue?**
+- Requires Redis (additional infrastructure)
+- Database queue is simpler for MVP and adequate for volume
+- Can migrate to Bull/BullMQ later if needed (no code rewrites)
+
+**Why not GraphQL for internal APIs?**
+- REST is simpler for internal dashboard APIs
+- No need for complex querying (most API calls are CRUD)
+- Reduces dependencies and complexity
+
+**Why not tRPC?**
+- Adds complexity (procedure definitions, router setup)
+- Not needed for simple internal APIs
+- REST endpoints are more familiar to most developers
+
+**Why not Supabase/PlanetScale instead of Neon?**
+- Neon has excellent Next.js integration
+- Neon's branching is useful for development
+- No strong preference (any managed Postgres works)
+
+---
+
+## 4) Environment Configuration
+
+### 4.1 Required Environment Variables
+
+Create `.env.local` file with these variables:
+
+```bash
+# ============================================
+# APPLICATION
+# ============================================
+
+# Node environment (development | production | test)
+NODE_ENV=production
+
+# Full URL of your deployed app (no trailing slash)
+APP_URL=https://sync.yourdomain.com
+
+# ============================================
+# SECURITY
+# ============================================
+
+# Session encryption key (32+ chars, cryptographically random)
+# Generate: openssl rand -base64 32
+SESSION_PASSWORD=your-32-char-minimum-session-password-here
+
+# Data encryption key for API tokens (64 hex chars)
+# Generate: openssl rand -hex 32
+DATA_ENCRYPTION_KEY=64-char-hex-encoded-key-for-aes-256-gcm-encryption
+
+# Admin dashboard password (bcrypt hash)
+# Generate: node -e "console.log(require('bcryptjs').hashSync('YourPassword123!', 10))"
+DASHBOARD_PASSWORD_HASH=$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy
+
+# ============================================
+# DATABASE
+# ============================================
+
+# Neon PostgreSQL connection string (with connection pooling)
+DATABASE_URL=postgresql://user:password@ep-cool-name-123456.us-east-2.aws.neon.tech/dbname?sslmode=require&pgbouncer=true
+
+# Direct connection (no pooling) for migrations
+DIRECT_DATABASE_URL=postgresql://user:password@ep-cool-name-123456.us-east-2.aws.neon.tech/dbname?sslmode=require
+
+# ============================================
+# RATE LIMITING & RETRIES
+# ============================================
+
+# Global max writes per minute (Webflow limit is 60/min per token)
+# Set lower for safety margin
+WRITE_CAP_PER_MINUTE=50
+
+# Maximum retry attempts before marking as dead letter
+MAX_RETRY_ATTEMPTS=5
+
+# Initial retry backoff in milliseconds
+RETRY_BACKOFF_MS=1000
+
+# Maximum retry backoff in milliseconds (capped at 1 minute)
+MAX_RETRY_BACKOFF_MS=60000
+
+# ============================================
+# WORKER CONFIGURATION
+# ============================================
+
+# Number of events to process per cron invocation
+WORKER_BATCH_SIZE=25
+
+# Secret for protecting cron endpoint
+# Generate: openssl rand -base64 32
+CRON_SECRET=your-random-cron-secret-minimum-16-chars
+
+# Distributed lock timeout (5 minutes in milliseconds)
+LOCK_TIMEOUT_MS=300000
+
+# ============================================
+# EXTERNAL API DEFAULTS (Optional)
+# ============================================
+
+# These are optional defaults for convenience
+# Per-connection credentials override these
+
+# Webflow Personal Access Token
+WEBFLOW_TOKEN=
+
+# SmartSuite API Key
+SMARTSUITE_API_KEY=
+
+# ============================================
+# LOGGING & MONITORING
+# ============================================
+
+# Log level (debug | info | warn | error)
+LOG_LEVEL=info
+
+# Pretty logs for development (set to false for production JSON)
+PRETTY_LOGS=false
+
+# Sentry DSN for error tracking (optional)
+SENTRY_DSN=
+
+# BetterStack token for logging (optional)
+BETTERSTACK_TOKEN=
+
+# ============================================
+# FEATURE FLAGS
+# ============================================
+
+# Enable backfill feature (fetch historical records)
+ENABLE_BACKFILL=true
+
+# Enable reference field mapping (linked records)
+ENABLE_REFERENCE_FIELDS=true
+
+# Enable image proxy (download and re-upload private images)
+ENABLE_IMAGE_PROXY=false
+
+# ============================================
+# DEVELOPMENT ONLY
+# ============================================
+
+# Skip webhook signature verification (dev only!)
+DEV_SKIP_SIGNATURE_VERIFICATION=false
+
+# Mock external API calls (testing)
+MOCK_EXTERNAL_APIS=false
+```
+
+### 4.2 Environment Variable Validation
+
+The app uses `@t3-oss/env-nextjs` to validate all environment variables at build time. Create `lib/env.ts`:
+
+**Validation Requirements:**
+- `SESSION_PASSWORD`: Must be at least 32 characters
+- `DATA_ENCRYPTION_KEY`: Must be exactly 64 hex characters
+- `DASHBOARD_PASSWORD_HASH`: Must start with `$2a$` or `$2b$` (bcrypt format)
+- `DATABASE_URL`: Must be valid PostgreSQL connection string
+- `APP_URL`: Must be valid HTTPS URL (HTTP allowed in dev)
+- `CRON_SECRET`: Must be at least 16 characters
+- Numeric vars: Must be valid integers within specified ranges
+
+**Error Handling:**
+- If any required var is missing or invalid, the app should fail to start
+- Display clear error message indicating which var is invalid
+- In development, suggest how to generate the var (e.g., "Run: openssl rand -hex 32")
+
+### 4.3 Generating Secrets
+
+Provide these commands in README:
+
+```bash
+# Generate SESSION_PASSWORD (32+ chars)
+openssl rand -base64 32
+
+# Generate DATA_ENCRYPTION_KEY (64 hex chars)
+openssl rand -hex 32
+
+# Generate CRON_SECRET
+openssl rand -base64 32
+
+# Generate DASHBOARD_PASSWORD_HASH
+# Replace 'YourPasswordHere' with your actual password
+node -e "console.log(require('bcryptjs').hashSync('YourPasswordHere', 10))"
+```
+
+### 4.4 Sensitive Variable Handling
+
+**Never Log These Variables:**
+- `SESSION_PASSWORD`
+- `DATA_ENCRYPTION_KEY`
+- `DASHBOARD_PASSWORD_HASH`
+- `CRON_SECRET`
+- API tokens (from database after decryption)
+
+**Redaction Strategy:**
+- When logging errors that might include env vars, redact sensitive fields
+- Example: Replace `SESSION_PASSWORD=abc123` with `SESSION_PASSWORD=***`
+- Use pino redaction feature: `redact: ['req.headers.authorization', 'env.SESSION_PASSWORD']`
+
+### 4.5 Environment-Specific Configs
+
+**Development (.env.local):**
+- `LOG_LEVEL=debug`
+- `PRETTY_LOGS=true`
+- `DEV_SKIP_SIGNATURE_VERIFICATION=true` (optional, for testing without SmartSuite)
+- Can use HTTP for `APP_URL` (e.g., http://localhost:3000)
+
+**Production (.env.production or Vercel settings):**
+- `LOG_LEVEL=info`
+- `PRETTY_LOGS=false`
+- `DEV_SKIP_SIGNATURE_VERIFICATION=false` (or omit)
+- Must use HTTPS for `APP_URL`
+- Set all security vars (never commit to git)
+
+**Test (.env.test):**
+- `NODE_ENV=test`
+- `DATABASE_URL` pointing to test database
+- `MOCK_EXTERNAL_APIS=true`
+- Relaxed validation for faster tests
+
+---
+
+## 5) Database Schema
+
+### 5.1 Complete Prisma Schema
+
+**File**: `prisma/schema.prisma`
+
+```prisma
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["fullTextSearch", "fullTextIndex"]
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_DATABASE_URL")
+}
+
+// ============================================
+// ENUMS
+// ============================================
+
+enum EventStatus {
+  queued          // Waiting to be processed
+  processing      // Currently being processed by worker
+  success         // Successfully processed
+  failed          // Failed but retriable (will retry)
+  dead_letter     // Failed permanently (exhausted retries)
+  skipped         // Intentionally skipped (e.g., connection paused)
+}
+
+enum SourceType {
+  smartsuite      // SmartSuite (default)
+  // Future: airtable, notion, etc.
+}
+
+enum TargetType {
+  webflow         // Webflow CMS (default)
+  // Future: contentful, sanity, etc.
+}
+
+enum ConnectionStatus {
+  active          // Connection is operational
+  paused          // User paused sync (don't process events)
+  error           // Connection has critical errors (e.g., invalid token)
+  archived        // Soft deleted
+}
+
+enum FieldMappingType {
+  direct          // Simple field-to-field (e.g., sku → sku)
+  jsonata         // JSONata expression (e.g., $.price * 1.1)
+  template        // String template (e.g., "{{sku}}-{{name}}")
+  constant        // Fixed value (e.g., always set status="active")
+  reference       // Lookup via IdMap (for linked records)
+}
+
+// ============================================
+// CONNECTION
+// ============================================
+
+model Connection {
+  id                 String            @id @default(uuid())
+  name               String            // User-friendly name
+  description        String?           @db.Text
+  status             ConnectionStatus  @default(active)
+  
+  // Source configuration (SmartSuite)
+  sourceType         SourceType        @default(smartsuite)
+  ssBaseId           String            @map("ss_base_id")           // Solution ID
+  ssTableId          String            @map("ss_table_id")          // Application ID
+  ssApiKeyEnc        String            @map("ss_api_key_enc")       // Encrypted API key
+  ssApiKeyIv         String            @map("ss_api_key_iv")        // AES-GCM IV (12 bytes, base64)
+  
+  // Target configuration (Webflow)
+  targetType         TargetType        @default(webflow)
+  wfSiteId           String            @map("wf_site_id")
+  wfCollectionId     String            @map("wf_collection_id")
+  wfTokenEnc         String            @map("wf_token_enc")         // Encrypted PAT
+  wfTokenIv          String            @map("wf_token_iv")          // AES-GCM IV
+  
+  // Webhook configuration
+  webhookSecretHash  String            @map("webhook_secret_hash")  // bcrypt hash
+  webhookUrl         String?           @map("webhook_url")          // Generated: {APP_URL}/api/hooks/{id}
+  
+  // Rate limiting (per-connection)
+  rateLimitPerMin    Int               @default(50) @map("rate_limit_per_min")
+  maxRetries         Int               @default(5) @map("max_retries")
+  retryBackoffMs     Int               @default(1000) @map("retry_backoff_ms")
+  
+  // Backfill configuration
+  backfillEnabled    Boolean           @default(false) @map("backfill_enabled")
+  backfillBatchSize  Int               @default(100) @map("backfill_batch_size")
+  lastBackfillAt     DateTime?         @map("last_backfill_at")
+  
+  // Behavior flags
+  deleteOnRemove     Boolean           @default(false) @map("delete_on_remove")  // Hard delete vs archive
+  skipOnError        Boolean           @default(false) @map("skip_on_error")     // Skip if mapping fails
+  
+  // Health tracking
+  lastSuccessAt      DateTime?         @map("last_success_at")
+  lastErrorAt        DateTime?         @map("last_error_at")
+  lastErrorMessage   String?           @map("last_error_message") @db.Text
+  consecutiveErrors  Int               @default(0) @map("consecutive_errors")
+  
+  // Metadata
+  createdAt          DateTime          @default(now()) @map("created_at")
+  updatedAt          DateTime          @updatedAt @map("updated_at")
+  createdBy          String?           @map("created_by")                        // User ID or email
+  
+  // Relations
+  mappings           Mapping[]
+  idMap              IdMap[]
+  events             Event[]
+  analytics          AnalyticsDaily[]
+  auditLogs          AuditLog[]
+  
+  @@index([status, updatedAt])
+  @@index([lastSuccessAt])
+  @@map("connections")
+}
+
+// ============================================
+// FIELD MAPPING
+// ============================================
+
+model Mapping {
+  id                 String            @id @default(uuid())
+  connectionId       String            @map("connection_id")
+  connection         Connection        @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+  
+  // Mapping configuration
+  version            Int               @default(1)                               // Schema version for migrations
+  
+  // Field map structure:
+  // {
+  //   "wf_field_slug": {
+  //     "type": "direct" | "jsonata" | "template" | "constant" | "reference",
+  //     "source": "$.smartsuite_field_slug",           // For direct, reference
+  //     "expression": "$.price * 1.1",                 // For jsonata
+  //     "template": "{{sku}}-{{kebab(name)}}",        // For template
+  //     "value": "default_value",                      // For constant
+  //     "default": "fallback_value",                   // Fallback if source is null
+  //     "transform": "uppercase" | "lowercase" | etc.
+  //   }
+  // }
+  fieldMap           Json              @map("field_map")
+  
+  // Slug generation
+  // Template example: "{{sku}}-{{kebab(name)}}"
+  slugTemplate       String?           @map("slug_template")
+  
+  // Status behavior
+  // {
+  //   "sold": { "archive": true },
+  //   "deleted": { "delete": true }
+  // }
+  statusBehavior     Json?             @map("status_behavior")
+  
+  // Image field mapping
+  // {
+  //   "primary": "$.images[0].url",
+  //   "gallery": "$.images[*].url",
+  //   "fallback": "https://..."
+  // }
+  imageFieldMap      Json?             @map("image_field_map")
+  
+  // Reference field mapping (linked records)
+  // {
+  //   "wf_reference_field": {
+  //     "source": "$.linked_products",
+  //     "lookupBy": "sku",
+  //     "sourceField": "sku"
+  //   }
+  // }
+  referenceMap       Json?             @map("reference_map")
+  
+  // Validation
+  requiredFields     String[]          @map("required_fields")                    // WF fields that must have values
+  validationRules    Json?             @map("validation_rules")                   // Custom validation (future)
+  
+  // Metadata
+  isActive           Boolean           @default(true) @map("is_active")
+  createdAt          DateTime          @default(now()) @map("created_at")
+  updatedAt          DateTime          @updatedAt @map("updated_at")
+  
+  @@index([connectionId])
+  @@map("mappings")
+}
+
+// ============================================
+// ID MAPPING (External ID <-> Webflow ID)
+// ============================================
+
+model IdMap {
+  connectionId       String            @map("connection_id")
+  externalSource     String            @map("external_source")                    // e.g., "smartsuite"
+  externalId         String            @map("external_id")                        // SmartSuite record ID
+  
+  wfItemId           String            @map("wf_item_id")                         // Webflow item ID
+  wfSlug             String?           @map("wf_slug")                            // Cache for quick lookups
+  
+  // Sync tracking
+  lastSyncedAt       DateTime          @default(now()) @map("last_synced_at")
+  syncCount          Int               @default(1) @map("sync_count")             // How many times synced
+  
+  // Snapshot of external data (for debugging)
+  externalData       Json?             @map("external_data")                      // Last payload snapshot
+  
+  connection         Connection        @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+  
+  @@id([connectionId, externalSource, externalId])
+  @@index([wfItemId])
+  @@index([wfSlug])
+  @@index([lastSyncedAt])
+  @@map("id_map")
+}
+
+// ============================================
+// EVENTS (Webhook Queue)
+// ============================================
+
+model Event {
+  id                 String            @id @default(uuid())
+  connectionId       String            @map("connection_id")
+  connection         Connection        @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+  
+  // Source identification
+  externalSource     String            @map("external_source")                    // "smartsuite"
+  externalId         String            @map("external_id")                        // SmartSuite record ID
+  
+  // Idempotency
+  idempotencyKey     String            @unique @map("idempotency_key")           // From x-idempotency-key or hash
+  
+  // Payload
+  payload            Json                                                         // Full webhook payload
+  payloadHash        String            @map("payload_hash")                      // SHA-256 for dedup
+  
+  // Processing status
+  status             EventStatus       @default(queued)
+  attempts           Int               @default(0)
+  retryAfter         DateTime?         @map("retry_after")                        // When to retry (exponential backoff)
+  
+  // Results
+  error              String?           @db.Text
+  errorStack         String?           @map("error_stack") @db.Text
+  partialSuccess     Boolean           @default(false) @map("partial_success")   // Some fields worked, some didn't
+  warnings           Json?                                                        // Non-fatal issues (e.g., image failed)
+  
+  // Timing
+  queuedAt           DateTime          @default(now()) @map("queued_at")
+  processedAt        DateTime?         @map("processed_at")
+  durationMs         Int?              @map("duration_ms")                        // Processing time
+  
+  // Webflow response
+  wfItemId           String?           @map("wf_item_id")                         // Resulting Webflow item ID
+  wfResponse         Json?             @map("wf_response")                        // Full Webflow API response
+  
+  // Metadata
+  webhookTimestamp   DateTime?         @map("webhook_timestamp")                  // From SmartSuite webhook
+  createdAt          DateTime          @default(now()) @map("created_at")
+  
+  @@index([connectionId, status, queuedAt])
+  @@index([status, retryAfter])
+  @@index([idempotencyKey])
+  @@index([payloadHash])
+  @@index([externalSource, externalId])
+  @@map("events")
+}
+
+// ============================================
+// ANALYTICS
+// ============================================
+
+model AnalyticsDaily {
+  id                 String            @id @default(uuid())
+  date               DateTime          @default(now()) @db.Date
+  connectionId       String            @map("connection_id")
+  connection         Connection        @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+  
+  // Volume metrics
+  eventsTotal        Int               @default(0) @map("events_total")
+  eventsSuccess      Int               @default(0) @map("events_success")
+  eventsFailed       Int               @default(0) @map("events_failed")
+  eventsDeadLetter   Int               @default(0) @map("events_dead_letter")
+  eventsSkipped      Int               @default(0) @map("events_skipped")
+  
+  // Latency metrics (in milliseconds)
+  p50LatencyMs       Int               @default(0) @map("p50_latency_ms")
+  p95LatencyMs       Int               @default(0) @map("p95_latency_ms")
+  p99LatencyMs       Int               @default(0) @map("p99_latency_ms")
+  avgLatencyMs       Int               @default(0) @map("avg_latency_ms")
+  
+  // Error analysis
+  // [{ "error": "Field 'price' must be number", "count": 15 }]
+  topErrors          Json?             @map("top_errors")
+  
+  createdAt          DateTime          @default(now()) @map("created_at")
+  
+  @@unique([connectionId, date])
+  @@index([date])
+  @@map("analytics_daily")
+}
+
+// ============================================
+// AUDIT LOG
+// ============================================
+
+model AuditLog {
+  id                 String            @id @default(uuid())
+  connectionId       String?           @map("connection_id")
+  connection         Connection?       @relation(fields: [connectionId], references: [id], onDelete: SetNull)
+  
+  action             String                                                       // e.g., "connection.created"
+  actor              String                                                       // User ID, email, or "system"
+  ipAddress          String?           @map("ip_address")
+  userAgent          String?           @map("user_agent")
+  
+  // Change tracking
+  before             Json?                                                        // State before change
+  after              Json?                                                        // State after change
+  metadata           Json?                                                        // Additional context
+  
+  createdAt          DateTime          @default(now()) @map("created_at")
+  
+  @@index([connectionId, createdAt])
+  @@index([action, createdAt])
+  @@map("audit_logs")
+}
+
+// ============================================
+// DISTRIBUTED LOCK (Worker Coordination)
+// ============================================
+
+model DistributedLock {
+  id                 String            @id                                        // Lock name (e.g., "worker:ingest")
+  acquiredBy         String            @map("acquired_by")                        // Process ID (nanoid)
+  acquiredAt         DateTime          @default(now()) @map("acquired_at")
+  expiresAt          DateTime          @map("expires_at")
+  
+  @@index([expiresAt])
+  @@map("distributed_locks")
+}
+```
+
+### 5.2 Migration Strategy
+
+**Initial Setup**:
+```bash
+# Create migration
+npx prisma migrate dev --name init
+
+# Generate Prisma Client
+npx prisma generate
+```
+
+**Schema Changes After Initial Deployment**:
+- Always use expand-contract pattern for breaking changes
+- Example: Renaming column
+  1. Deploy: Add new column, copy data, keep old column
+  2. Update app to use new column
+  3. Deploy: Drop old column after verification
+
+**Rollback Strategy**:
+- Keep migrations reversible where possible
+- Test rollback in staging environment
+- Document any manual steps required for rollback
+
+### 5.3 Indexes Strategy
+
+**Query Patterns to Optimize**:
+
+1. **Worker fetching events**:
+   ```sql
+   SELECT * FROM events 
+   WHERE connectionId = ? 
+     AND status IN ('queued', 'failed')
+     AND (retryAfter IS NULL OR retryAfter <= NOW())
+   ORDER BY queuedAt ASC 
+   LIMIT 25;
+   ```
+   Index: `(connectionId, status, queuedAt)`
+
+2. **Dashboard events inbox**:
+   ```sql
+   SELECT * FROM events 
+   WHERE connectionId = ?
+     AND status = ?
+   ORDER BY createdAt DESC;
+   ```
+   Index: `(connectionId, status, createdAt)`
+
+3. **Idempotency check**:
+   ```sql
+   SELECT * FROM events WHERE idempotencyKey = ?;
+   ```
+   Index: `(idempotencyKey)` UNIQUE
+
+4. **IdMap lookup for upsert**:
+   ```sql
+   SELECT * FROM id_map 
+   WHERE connectionId = ? 
+     AND externalSource = ?
+     AND externalId = ?;
+   ```
+   Index: Primary key composite
+
+5. **Analytics aggregation**:
+   ```sql
+   SELECT * FROM analytics_daily 
+   WHERE connectionId = ?
+     AND date >= ?
+   ORDER BY date DESC;
+   ```
+   Index: `(connectionId, date)` UNIQUE
+
+### 5.4 Data Retention Policy
+
+**Events Table**:
+- Keep all events for at least 90 days
+- Archive older events to cold storage (optional)
+- Never delete `dead_letter` events (manual review required)
+
+**Analytics Table**:
+- Keep daily rollups indefinitely (small footprint)
+- Compute on-demand for date ranges not yet rolled up
+
+**Audit Logs**:
+- Keep for 1 year minimum (compliance)
+- Consider longer retention for sensitive actions
+
+**IdMap**:
+- Never delete unless connection is deleted
+- Soft delete items (keep with archived flag) even if removed from SmartSuite
+
+### 5.5 Database Client Setup
+
+**File**: `lib/db.ts`
+
+```typescript
+// Singleton pattern for Prisma Client
+// Prevents hot reload from creating multiple instances in development
+```
+
+**Requirements**:
+- Export single `prisma` instance
+- Use `globalThis` in development to prevent multiple instances
+- Enable query logging in development (`log: ['query', 'error', 'warn']`)
+- Disable query logging in production (only errors)
+- Add middleware for soft deletes if implementing
+- Add middleware for automatic `updatedAt` timestamp
+
+---
+
+## 6) External API Integration Details
+
+### 6.1 SmartSuite API
+
+**Base URL**: `https://app.smartsuite.com/api/v1`
+
+**Authentication**:
+```
+Authorization: Token {apiKey}
+Content-Type: application/json
+```
+
+#### 6.1.1 List Solutions (Bases)
+
+**Endpoint**: `GET /bases`
+
+**Purpose**: Get all available solutions (bases) for API key
+
+**Response**:
+```json
+{
+  "solutions": [
+    {
+      "id": "solution_abc123",
+      "name": "Product Management",
+      "description": "Track all products",
+      "created_on": "2024-01-01T00:00:00Z"
+    }
+  ]
+}
+```
+
+**Usage**: Populate dropdown in mapping wizard Step 2
+
+#### 6.1.2 List Applications (Tables)
+
+**Endpoint**: `GET /bases/{baseId}/apps`
+
+**Purpose**: Get all tables/apps within a solution
+
+**Response**:
+```json
+{
+  "applications": [
+    {
+      "id": "app_xyz789",
+      "slug": "products",
+      "name": "Products",
+      "description": "Product inventory"
+    }
+  ]
+}
+```
+
+**Usage**: Populate table dropdown in mapping wizard Step 2
+
+#### 6.1.3 Get Application Schema
+
+**Endpoint**: `GET /bases/{baseId}/apps/{tableId}/schema`
+
+**Purpose**: Get full schema including all fields, types, and configurations
+
+**Response**:
+```json
+{
+  "structure": {
+    "fields": [
+      {
+        "slug": "title",
+        "label": "Product Name",
+        "field_type": "textfield",
+        "required": true,
+        "params": {}
+      },
+      {
+        "slug": "price",
+        "label": "Price",
+        "field_type": "numberfield",
+        "required": false,
+        "params": {
+          "decimal_places": 2,
+          "prefix": "$"
+        }
+      },
+      {
+        "slug": "status",
+        "label": "Status",
+        "field_type": "singleselectfield",
+        "params": {
+          "choices": [
+            { "value": "active", "label": "Active" },
+            { "value": "sold", "label": "Sold" },
+            { "value": "archived", "label": "Archived" }
+          ]
+        }
+      },
+      {
+        "slug": "images",
+        "label": "Product Images",
+        "field_type": "files",
+        "params": {
+          "allowed_file_types": ["image/*"]
+        }
+      },
+      {
+        "slug": "category",
+        "label": "Category",
+        "field_type": "linkedrecord",
+        "params": {
+          "linked_application": "app_categories"
+        }
+      }
+    ]
+  }
+}
+```
+
+**Field Types to Handle**:
+- `textfield`: Short text
+- `textarea`: Long text (rich text possible)
+- `numberfield`: Numeric value
+- `currencyfield`: Currency with symbol
+- `percentagefield`: Percentage value
+- `duedatefield`: Date
+- `timefield`: Time
+- `singleselectfield`: Single choice
+- `multipleselectfield`: Multiple choices
+- `statusfield`: Status with color
+- `singlecheckbox`: Boolean
+- `linkedrecord`: Reference to other table
+- `files`: File attachments (may be images)
+- `emailfield`: Email address
+- `phonefield`: Phone number
+- `urlfield`: URL
+- `formulafield`: Calculated field (read-only)
+- `autonumberfield`: Auto-incrementing number (read-only)
+
+#### 6.1.4 List Records
+
+**Endpoint**: `GET /bases/{baseId}/apps/{tableId}/records`
+
+**Query Parameters**:
+- `limit`: Number of records (max 100)
+- `offset`: Pagination offset
+- `filter`: JSON filter object (optional)
+- `sort`: JSON sort array (optional)
+
+**Purpose**: For backfill or testing with sample data
+
+**Response**:
+```json
+{
+  "items": [
+    {
+      "id": "rec_abc123",
+      "created_on": "2024-01-01T00:00:00Z",
+      "updated_on": "2024-01-02T00:00:00Z",
+      "title": "Widget Pro",
+      "price": 99.99,
+      "status": "active",
+      "images": [
+        {
+          "url": "https://smartsuite-files.s3.amazonaws.com/...",
+          "filename": "widget.jpg",
+          "size": 123456
+        }
+      ],
+      "category": [
+        {
+          "id": "rec_cat_xyz",
+          "title": "Electronics"
+        }
+      ]
+    }
+  ],
+  "total_count": 150
+}
+```
+
+#### 6.1.5 Webhook Payload Structure
+
+**Headers Sent by SmartSuite**:
+```
+Content-Type: application/json
+x-smartsuite-signature: sha256=abc123...
+x-smartsuite-timestamp: 1697200000
+x-smartsuite-event: record_created
+```
+
+**Payload**:
+```json
+{
+  "event_type": "record_created" | "record_updated" | "record_deleted",
+  "solution_id": "solution_abc123",
+  "application_id": "app_xyz789",
+  "record_id": "rec_item_123",
+  "timestamp": "2024-10-13T10:30:00Z",
+  "data": {
+    "id": "rec_item_123",
+    "title": "New Product",
+    "price": 49.99,
+    "status": "active",
+    "created_on": "2024-10-13T10:30:00Z",
+    "updated_on": "2024-10-13T10:30:00Z",
+    // ... all other fields using field slugs as keys
+  }
+}
+```
+
+**Signature Verification**:
+```
+HMAC-SHA256(payload_body, webhook_secret) == signature
+```
+
+**Implementation Notes**:
+- Secret is generated by our app and configured in SmartSuite webhook settings
+- Timestamp should be within 5 minutes of current time (prevent replay attacks)
+- Signature is computed over raw request body, not parsed JSON
+
+### 6.2 Webflow API
+
+**Base URL**: `https://api.webflow.com/v2`
+
+**Authentication**:
+```
+Authorization: Bearer {personalAccessToken}
+```
+
+#### 6.2.1 List Sites
+
+**Endpoint**: `GET /sites`
+
+**Purpose**: Get all sites accessible to the PAT
+
+**Response**:
+```json
+{
+  "sites": [
+    {
+      "id": "site_abc123",
+      "displayName": "My Store",
+      "shortName": "my-store",
+      "createdOn": "2024-01-01T00:00:00Z"
+    }
+  ]
+}
+```
+
+#### 6.2.2 List Collections
+
+**Endpoint**: `GET /sites/{siteId}/collections`
+
+**Purpose**: Get all CMS collections in a site
+
+**Response**:
+```json
+{
+  "collections": [
+    {
+      "id": "col_xyz789",
+      "displayName": "Products",
+      "slug": "products",
+      "createdOn": "2024-01-01T00:00:00Z"
+    }
+  ]
+}
+```
+
+#### 6.2.3 Get Collection Schema
+
+**Endpoint**: `GET /collections/{collectionId}`
+
+**Purpose**: Get full collection schema with all fields
+
+**Response**:
+```json
+{
+  "id": "col_xyz789",
+  "displayName": "Products",
+  "slug": "products",
+  "fields": [
+    {
+      "id": "field_name_123",
+      "slug": "name",
+      "displayName": "Name",
+      "type": "PlainText",
+      "isRequired": true,
+      "validations": {
+        "maxLength": 256
+      }
+    },
+    {
+      "id": "field_slug_456",
+      "slug": "slug",
+      "displayName": "Slug",
+      "type": "PlainText",
+      "isRequired": true,
+      "validations": {
+        "format": "slug"
+      }
+    },
+    {
+      "id": "field_price_789",
+      "slug": "price",
+      "displayName": "Price",
+      "type": "Number",
+      "isRequired": false,
+      "validations": {
+        "min": 0,
+        "decimalPlaces": 2
+      }
+    },
+    {
+      "id": "field_image_abc",
+      "slug": "product-image",
+      "displayName": "Product Image",
+      "type": "Image",
+      "isRequired": false
+    },
+    {
+      "id": "field_gallery_def",
+      "slug": "gallery",
+      "displayName": "Image Gallery",
+      "type": "MultiImage",
+      "isRequired": false
+    },
+    {
+      "id": "field_category_ghi",
+      "slug": "category",
+      "displayName": "Category",
+      "type": "Reference",
+      "isRequired": false,
+      "validations": {
+        "collectionId": "col_categories_123"
+      }
+    }
+  ]
+}
+```
+
+**Field Types**:
+- `PlainText`: Short text (max 256 chars usually)
+- `RichText`: Long text with HTML formatting
+- `Number`: Numeric value
+- `DateTime`: ISO8601 datetime
+- `Switch`: Boolean (true/false)
+- `Option`: Single select from predefined options
+- `Image`: Single image (URL or upload)
+- `MultiImage`: Array of images
+- `File`: File attachment
+- `Video`: Video URL
+- `Link`: Link (URL, page, email, phone)
+- `Email`: Email address
+- `Phone`: Phone number
+- `Color`: Color value (hex or rgba)
+- `Reference`: Link to another collection item
+- `MultiReference`: Array of links to other items
+
+#### 6.2.4 Create Item (Live)
+
+**Endpoint**: `POST /collections/{collectionId}/items/live`
+
+**Purpose**: Create new item and publish immediately
+
+**Request Body**:
+```json
+{
+  "fieldData": {
+    "name": "Widget Pro",
+    "slug": "widget-pro",
+    "price": 99.99,
+    "product-image": "https://example.com/image.jpg",
+    "gallery": [
+      "https://example.com/img1.jpg",
+      "https://example.com/img2.jpg"
+    ],
+    "category": "cat_item_id_123"
+  }
+}
+```
+
+**Response**:
+```json
+{
+  "id": "item_new_xyz789",
+  "cmsLocaleId": "locale_default",
+  "lastPublished": "2024-10-13T10:30:00Z",
+  "lastUpdated": "2024-10-13T10:30:00Z",
+  "createdOn": "2024-10-13T10:30:00Z",
+  "isArchived": false,
+  "isDraft": false,
+  "fieldData": {
+    "name": "Widget Pro",
+    "slug": "widget-pro",
+    "price": 99.99,
+    // ... all fields
+  }
+}
+```
+
+#### 6.2.5 Update Item (Live)
+
+**Endpoint**: `PATCH /collections/{collectionId}/items/{itemId}/live`
+
+**Purpose**: Update existing item and republish
+
+**Request Body**:
+```json
+{
+  "fieldData": {
+    "price": 89.99  // Only fields you want to update
+  }
+}
+```
+
+**Response**: Same as create
+
+#### 6.2.6 Delete Item
+
+**Endpoint**: `DELETE /collections/{collectionId}/items/{itemId}`
+
+**Purpose**: Permanently delete item
+
+**Response**: 204 No Content
+
+**Note**: Should rarely be used; prefer archiving via `isArchived` field
+
+#### 6.2.7 Rate Limits
+
+**Limits**:
+- 60 requests per minute per access token
+- 10 concurrent requests max
+- Burst tolerance: Can briefly exceed but will throttle
+
+**Headers to Check**:
+```
+X-RateLimit-Limit: 60
+X-RateLimit-Remaining: 45
+X-RateLimit-Reset: 1697200060
+```
+
+**429 Response**:
+```json
+{
+  "message": "Rate limit exceeded",
+  "code": "rate_limit_exceeded"
+}
+```
+
+**Retry-After Header**: Sometimes included with 429
+
+**Implementation Strategy**:
+- Use per-connection queue (50 req/min default, configurable)
+- Exponential backoff on 429 (start at 1s, max 60s)
+- Parse `X-RateLimit-Remaining` and adjust queue dynamically
+- Log rate limit hits for monitoring
+
+### 6.3 Field Type Compatibility Matrix
+
+**SmartSuite Type** → **Compatible Webflow Types** (ordered by preference):
+
+```typescript
+const FIELD_TYPE_COMPATIBILITY = {
+  // Text fields
+  'textfield': ['PlainText', 'Link', 'Email', 'Phone'],
+  'textarea': ['RichText', 'PlainText'],
+  
+  // Numeric fields
+  'numberfield': ['Number'],
+  'currencyfield': ['Number'],
+  'percentagefield': ['Number'],
+  
+  // Date/time fields
+  'duedatefield': ['DateTime'],
+  'timefield': ['DateTime'],
+  
+  // Selection fields
+  'singleselectfield': ['Option', 'PlainText'],
+  'multipleselectfield': ['Option', 'PlainText'],  // Note: WF Option can be multi
+  'statusfield': ['Option', 'PlainText'],
+  
+  // Boolean
+  'singlecheckbox': ['Switch'],
+  
+  // Reference/Relations
+  'linkedrecord': ['Reference', 'MultiReference'],
+  
+  // Files/Images
+  'files': ['File', 'Image', 'MultiImage', 'Video'],
+  
+  // Contact fields
+  'emailfield': ['Email', 'PlainText'],
+  'phonefield': ['Phone', 'PlainText'],
+  'urlfield': ['Link', 'PlainText'],
+  
+  // Read-only fields (usually skip)
+  'formulafield': ['PlainText', 'Number'],  // Depends on formula result
+  'autonumberfield': ['PlainText', 'Number'],
+} as const;
+```
+
+**Auto-Mapping Logic**:
+1. Match by field name similarity (case-insensitive)
+   - Example: "title" → "name" (80% similarity)
+2. Match by field type compatibility
+   - Example: SmartSuite "textfield" → Webflow "PlainText"
+3. Suggest mapping only if both name AND type match
+4. Present all compatible types in dropdown for manual override
+
+**Special Handling**:
+
+**Images**:
+- SmartSuite `files` with `allowed_file_types: ["image/*"]` → Webflow `Image` or `MultiImage`
+- Check if URL is accessible (HEAD request with 5s timeout)
+- First valid image → `Image` field
+- Remaining valid images → `MultiImage` field
+- Invalid URLs: log warning, don't block item creation
+
+**Linked Records (References)**:
+- SmartSuite `linkedrecord` → Webflow `Reference` or `MultiReference`
+- Requires IdMap lookup to convert external ID → Webflow item ID
+- If external ID not found in IdMap:
+  - Option A: Skip this field (log warning)
+  - Option B: Try to find by slug (if available)
+  - Option C: Fail item creation (if `isRequired`)
+
+**Rich Text**:
+- SmartSuite `textarea` may contain Markdown or HTML
+- Webflow `RichText` expects HTML
+- Apply Markdown → HTML conversion if needed (use library like `marked`)
+
+**Options (Select Fields)**:
+- SmartSuite sends option value (e.g., "active")
+- Webflow expects option ID (e.g., "opt_abc123")
+- Need to map SmartSuite value → Webflow option ID
+- Get option IDs from collection schema (`fields[].validations.options`)
+
+### 6.4 Error Handling for External APIs
+
+**Retriable Errors**:
+- Network errors (ECONNREFUSED, ETIMEDOUT, socket hang up)
+- HTTP 429 (rate limit)
+- HTTP 500, 502, 503, 504 (server errors)
+- HTTP 408 (request timeout)
+
+**Non-Retriable Errors**:
+- HTTP 400 (bad request - fix mapping)
+- HTTP 401 (unauthorized - invalid token)
+- HTTP 403 (forbidden - missing permission)
+- HTTP 404 (not found - collection deleted?)
+- HTTP 422 (validation error - invalid data)
+
+**Error Response Examples**:
+
+**Webflow 400**:
+```json
+{
+  "message": "Field validation failed",
+  "code": "invalid_field_value",
+  "details": {
+    "field": "price",
+    "error": "Must be a number"
+  }
+}
+```
+
+**Webflow 401**:
+```json
+{
+  "message": "Invalid or expired token",
+  "code": "unauthorized"
+}
+```
+
+**SmartSuite 401**:
+```json
+{
+  "error": "Invalid API key"
+}
+```
+
+**Timeout**:
+- Set timeout for all API calls: 30 seconds
+- If timeout occurs, treat as retriable error
+- Log which API call timed out (URL, method)
+
+---
+
+## 7) Security Implementation
+
+### 7.1 Credential Encryption
+
+**Algorithm**: AES-256-GCM
+
+**Key Derivation**:
+- Use `DATA_ENCRYPTION_KEY` environment variable (64 hex chars = 32 bytes)
+- No PBKDF2/scrypt needed (key is already cryptographically random)
+
+**Encryption Process**:
+1. Generate random 12-byte IV (96 bits) for each encryption
+2. Encrypt plaintext with AES-GCM using key + IV
+3. Store ciphertext (base64) + IV (base64) in separate columns
+4. Never store plaintext credentials
+
+**Decryption Process**:
+1. Read ciphertext + IV from database
+2. Base64 decode both
+3. Decrypt using AES-GCM with key + IV
+4. Return plaintext (keep in memory, never log)
+
+**Implementation Requirements**:
+- Use `crypto.subtle` (Web Crypto API, available in Node 18+)
+- IV must be unique for each encryption (never reuse)
+- Ciphertext includes authentication tag (GCM provides this)
+- Rotation strategy: Provide admin command to re-encrypt all credentials with new key
+
+**File**: `lib/crypto.ts`
+
+**Functions**:
+```typescript
+async function encryptSecret(plaintext: string): Promise<{
+  ciphertext: string;  // base64
+  iv: string;          // base64
+}>
+
+async function decryptSecret(encrypted: {
+  ciphertext: string;
+  iv: string;
+}): Promise<string>
+
+function generateSecret(length: number = 32): string  // For webhook secrets
+```
+
+### 7.2 Webhook Signature Verification
+
+**Algorithm**: HMAC-SHA256
+
+**Process**:
+1. SmartSuite sends webhook with header: `x-smartsuite-signature: sha256=<hex>`
+2. Compute HMAC-SHA256(raw_request_body, webhook_secret)
+3. Compare computed signature with header signature (timing-safe)
+4. Reject if mismatch (return 401)
+
+**Timing Attack Prevention**:
+- Use `crypto.timingSafeEqual()` for signature comparison
+- Never use `===` for comparing secrets/signatures
+
+**Timestamp Verification**:
+- Check `x-smartsuite-timestamp` header
+- Reject if timestamp is >5 minutes old or in future
+- Prevents replay attacks
+
+**Implementation Requirements**:
+- Log all rejected webhooks (signature mismatch, old timestamp)
+- Include connection ID in logs for traceability
+- Rate limit webhook endpoint (e.g., 100 req/min per connection)
+
+**File**: `lib/webhook-security.ts`
+
+**Functions**:
+```typescript
+function verifyWebhookSignature(
+  body: string,          // Raw request body
+  signature: string,     // Header value
+  secret: string         // Webhook secret (plaintext)
+): boolean
+
+function verifyTimestamp(
+  timestamp: string,     // Unix timestamp from header
+  maxAgeSeconds: number  // Default 300 (5 min)
+): boolean
+```
+
+### 7.3 Dashboard Authentication
+
+**Method**: Password-based with iron-session
+
+**Flow**:
+1. User visits `/admin` → redirect to `/admin/login` if not authenticated
+2. User submits password
+3. Server compares bcrypt.compare(password, DASHBOARD_PASSWORD_HASH)
+4. If match: create session, set cookie, redirect to `/admin`
+5. If no match: show error, log failed attempt
+
+**Session Configuration**:
+- Cookie name: `smartsuite_webflow_session`
+- HttpOnly: true (JavaScript can't access)
+- Secure: true (production only, HTTPS required)
+- SameSite: lax (CSRF protection)
+- Max age: 7 days
+- Encrypted with SESSION_PASSWORD
+
+**Session Data Structure**:
+```typescript
+{
+  isAuthenticated: boolean;
+  user: {
+    id: 'admin';      // Single admin user
+    role: 'admin';
+  };
+  createdAt: number;  // Unix timestamp
+  expiresAt: number;  // Unix timestamp
+}
+```
+
+**Middleware Protection**:
+- All `/admin/*` routes (except `/admin/login`) require authentication
+- All `/api/connections/*`, `/api/mappings/*`, `/api/events/*` require auth
+- Public routes: `/api/hooks/*` (webhook ingress)
+
+**CSRF Protection**:
+- Generate CSRF token on GET requests to `/admin/*`
+- Store in cookie: `csrf-token` (HttpOnly)
+- Also return in header: `X-CSRF-Token`
+- On POST/PATCH/DELETE: verify header matches cookie
+- Reject if mismatch (403 Forbidden)
+
+**File**: `lib/session.ts`
+
+**Functions**:
+```typescript
+async function getSession(): Promise<IronSession<SessionData>>
+
+async function requireAuth(): Promise<SessionData>  // Throws if not authed
+
+async function createSession(password: string): Promise<boolean>
+
+async function destroySession(): Promise<void>
+```
+
+**File**: `middleware.ts`
+
+**Logic**:
+- Check if route requires auth
+- If yes: call `requireAuth()`, continue if success, redirect if fail
+- Generate/verify CSRF tokens as needed
+
+### 7.4 Secret Storage Best Practices
+
+**Environment Variables**:
+- Never commit `.env` files to git (add to `.gitignore`)
+- Use Vercel Environment Variables UI for production
+- Separate env vars for development/staging/production
+
+**Database Secrets**:
+- API keys/tokens: encrypted (see 7.1)
+- Webhook secrets: bcrypt hashed (see 7.2)
+- Passwords: bcrypt hashed (rounds=10)
+
+**Logging Restrictions**:
+- Never log plaintext credentials
+- Redact sensitive fields in logs
+- Example: `{ apiKey: '***', token: '***' }`
+
+**Access Control**:
+- Only admin can view/edit connection credentials
+- No API endpoint to retrieve decrypted credentials
+- Credentials decrypted only in server-side code, never sent to browser
+
+**Rotation Policy**:
+- Provide admin UI to update credentials (re-encrypt with new values)
+- Support emergency credential rotation (re-encrypt all with new DATA_ENCRYPTION_KEY)
+- Log all credential changes in audit log
+
+### 7.5 Security Headers
+
+**Required Headers** (set in `next.config.js`):
+
+```javascript
+{
+  headers: async () => [
+    {
+      source: '/(.*)',
+      headers: [
+        {
+          key: 'X-Content-Type-Options',
+          value: 'nosniff'
+        },
+        {
+          key: 'X-Frame-Options',
+          value: 'DENY'
+        },
+        {
+          key: 'X-XSS-Protection',
+          value: '1; mode=block'
+        },
+        {
+          key: 'Referrer-Policy',
+          value: 'strict-origin-when-cross-origin'
+        },
+        {
+          key: 'Permissions-Policy',
+          value: 'camera=(), microphone=(), geolocation=()'
+        }
+      ]
+    }
+  ]
+}
+```
+
+**Content Security Policy** (CSP):
+- Start with report-only mode
+- Gradually tighten based on violations
+- Example restrictive CSP:
+  ```
+  default-src 'self';
+  script-src 'self' 'unsafe-inline' 'unsafe-eval';
+  style-src 'self' 'unsafe-inline';
+  img-src 'self' data: https:;
+  font-src 'self' data:;
+  connect-src 'self' https://api.webflow.com https://app.smartsuite.com;
+  ```
+
+### 7.6 Rate Limiting
+
+**Webhook Ingress**:
+- Limit: 100 requests/minute per connection ID
+- If exceeded: return 429 with `Retry-After` header
+- Use in-memory counter (reset every minute)
+
+**Dashboard API**:
+- Limit: 100 requests/minute per session
+- Less critical (admin only)
+
+**External APIs**:
+- Handled by queue (50 req/min default per connection)
+- Respect `X-RateLimit-*` headers from APIs
+- Implement exponential backoff on 429
+
+### 7.7 Security Checklist
+
+- [ ] All credentials encrypted at rest (AES-256-GCM)
+- [ ] Webhook signatures verified (HMAC-SHA256)
+- [ ] Webhook timestamps checked (max 5 min old)
+- [ ] Dashboard password protected (bcrypt)
+- [ ] Session cookies encrypted (iron-session)
+- [ ] Session cookies HttpOnly + Secure + SameSite=lax
+- [ ] CSRF tokens on all mutations
+- [ ] No sensitive data in logs
+- [ ] Security headers set (CSP, X-Frame-Options, etc.)
+- [ ] Rate limiting on webhook endpoint
+- [ ] Audit log for all credential changes
+- [ ] No API endpoint exposes decrypted credentials
+- [ ] All external API calls use HTTPS
+- [ ] Timeout on all external API calls (30s)
+- [ ] Error messages don't leak sensitive info
+
+---
+
+## 8) Core Business Logic
+
+### 8.1 Event Lifecycle State Machine
+
+```
+                                    ┌───────────────────────────────┐
+                                    │     Webhook Received          │
+                                    │   - Verify signature          │
+                                    │   - Check idempotency         │
+                                    └──────────────┬────────────────┘
+                                                   │
+                                                   │ Insert Event
+                                                   ↓
+                                    ┌──────────────────────────────┐
+                                    │      queued                   │
+                                    │  - Waiting for worker         │
+                                    └──────────────┬───────────────┘
+                                                   │
+                                                   │ Worker picks up
+                                                   ↓
+                                    ┌──────────────────────────────┐
+                                    │      processing               │
+                                    │  - attempts++                 │
+                                    │  - Load config                │
+                                    │  - Transform data             │
+                                    │  - Call Webflow API           │
+                                    └──────────────┬───────────────┘
+                                                   │
+                                  ┌────────────────┼────────────────┐
+                                  │                │                │
+                             Success          Retriable Error   Non-Retriable
+                                  │                │              Error
+                                  ↓                ↓                │
+                   ┌──────────────────┐  ┌─────────────────┐       │
+                   │   success         │  │   failed        │       │
+                   │ - processedAt     │  │ - retryAfter    │       │
+                   │ - durationMs      │  │ - error msg     │       │
+                   │ - wfItemId        │  └────────┬────────┘       │
+                   └───────────────────┘           │                │
+                                                   │                │
+                                          attempts < max?           │
+                                                   │                │
+                                              Yes  │  No            │
+                                                   │  │             │
+                                    ┌──────────────┘  │             │
+                                    │                 ↓             ↓
+                                    ↓      ┌──────────────────────────────┐
+                          Back to queued   │     dead_letter               │
+                          (after retryAfter)│  - Exhausted retries         │
+                                           │  - Manual review needed       │
+                                           └──────────────────────────────┘
+
+   ┌────────────────────────────────────────┐
+   │  skipped                               │
+   │  - Connection paused                   │
+   │  - Intentional skip (e.g., delete)     │
+   └────────────────────────────────────────┘
+```
+
+**State Transitions**:
+
+| From | To | Condition |
+|------|------|-----------|
+| queued | processing | Worker starts processing |
+| processing | success | Webflow API call succeeds |
+| processing | failed | Retriable error + attempts < maxRetries |
+| processing | dead_letter | Non-retriable error OR attempts >= maxRetries |
+| processing | skipped | Connection status != active |
+| failed | queued | retryAfter timestamp reached |
+| dead_letter | queued | Manual replay triggered |
+
+### 8.2 Idempotency Strategy
+
+**Goal**: Prevent duplicate processing if SmartSuite sends same webhook twice
+
+**Implementation**:
+
+1. **Idempotency Key Source** (priority order):
+   - If webhook includes `x-idempotency-key` header: use that
+   - Else: compute SHA-256 hash of payload + connectionId + externalId
+   
+2. **Check on Webhook Ingress**:
+   ```sql
+   SELECT id FROM events WHERE idempotencyKey = ?
+   ```
+   - If found: return 409 Conflict with existing event ID
+   - If not found: insert new event
+
+3. **Hash Payload for Dedup**:
+   - Store `payloadHash` = SHA-256(JSON.stringify(payload))
+   - Use for detecting truly duplicate payloads (same data)
+   - Different from idempotency key (which prevents any duplicate webhook)
+
+**Example**:
+```
+Webhook 1: POST /api/hooks/conn123
+  x-idempotency-key: ss_event_abc
+  payload: { record_id: "rec_1", data: {...} }
+  → Create Event(id=evt_1, idempotencyKey=ss_event_abc)
+
+Webhook 2 (retry): POST /api/hooks/conn123
+  x-idempotency-key: ss_event_abc
+  payload: { record_id: "rec_1", data: {...} }
+  → Find Event(idempotencyKey=ss_event_abc) → return 409 Conflict
+
+Webhook 3 (different event): POST /api/hooks/conn123
+  x-idempotency-key: ss_event_def
+  payload: { record_id: "rec_2", data: {...} }
+  → Create Event(id=evt_2, idempotencyKey=ss_event_def)
+```
+
+### 8.3 Upsert Logic (Create vs Update)
+
+**Decision Tree**:
+```
+Event received
+  ↓
+Query IdMap: WHERE connectionId = ? AND externalId = ?
+  ↓
+  ├─ Found → UPDATE
+  │    ↓
+  │    PATCH /collections/{collectionId}/items/{wfItemId}/live
+  │    ↓
+  │    Update IdMap: lastSyncedAt=NOW(), syncCount++
+  │
+  └─ Not Found → CREATE
+       ↓
+       POST /collections/{collectionId}/items/live
+       ↓
+       Insert IdMap: (connectionId, externalId, wfItemId)
+```
+
+**Slug Collision Handling**:
+- Webflow requires unique slugs per collection
+- If POST returns 409 (slug conflict):
+  - Append `-{counter}` to slug
+  - Try again with `product-name-1`
+  - Increment counter until success (max 10 attempts)
+  - If still fails: log error, mark event as failed
+
+**Example**:
+```typescript
+// First attempt: slug = "product-name"
+// POST → 409 Conflict (slug exists)
+
+// Retry: slug = "product-name-1"
+// POST → 409 Conflict (slug exists)
+
+// Retry: slug = "product-name-2"
+// POST → 201 Created ✓
+```
+
+### 8.4 Reference Field Resolution
+
+**Problem**: SmartSuite sends linked record IDs, but Webflow needs Webflow item IDs
+
+**Example**:
+```
+SmartSuite payload:
+{
+  "category": [
+    { "id": "rec_cat_electronics", "title": "Electronics" }
+  ]
+}
+
+Need to convert:
+  rec_cat_electronics → wf_category_item_xyz
+```
+
+**Solution**:
+
+1. **Prerequisite**: Category must already be synced (has IdMap entry)
+
+2. **Lookup**:
+   ```sql
+   SELECT wfItemId FROM id_map
+   WHERE connectionId = ?
+     AND externalId = 'rec_cat_electronics'
+   ```
+
+3. **Handle Not Found**:
+   - Option A: Skip reference field (log warning)
+   - Option B: Create stub item in referenced collection (complex)
+   - Option C: Fail event if field is required
+
+4. **Set Webflow Field**:
+   ```json
+   {
+     "fieldData": {
+       "category": "wf_category_item_xyz"  // Single reference
+     }
+   }
+   ```
+
+5. **Multi-Reference**:
+   ```json
+   {
+     "fieldData": {
+       "tags": ["wf_tag_1", "wf_tag_2", "wf_tag_3"]  // Array
+     }
+   }
+   ```
+
+**Configuration in Mapping**:
+```json
+{
+  "referenceMap": {
+    "category": {
+      "source": "$.category[0].id",      // JSONPath to SmartSuite ref ID
+      "lookupBy": "externalId",          // How to find in IdMap
+      "collectionId": "col_categories"   // Optional: if cross-connection
+    }
+  }
+}
+```
+
+### 8.5 Image Handling
+
+**SmartSuite Images**:
+- Sent as array of objects: `[{ url, filename, size }]`
+- URLs may be S3 presigned URLs (expire after time)
+- May be multiple images
+
+**Validation**:
+1. Check if URL is accessible (HEAD request with 5s timeout)
+2. Verify content-type starts with `image/`
+3. If both pass: use URL
+4. If fails: log warning, try next image
+
+**Mapping to Webflow**:
+```json
+{
+  "imageFieldMap": {
+    "primary": "$.images[0].url",        // First valid image
+    "gallery": "$.images[*].url",        // All valid images
+    "fallback": "https://example.com/placeholder.jpg"
+  }
+}
+```
+
+**Result**:
+```json
+{
+  "fieldData": {
+    "product-image": "https://valid-url.jpg",  // Single image field
+    "gallery": [                               // Multi-image field
+      "https://valid-url-1.jpg",
+      "https://valid-url-2.jpg",
+      "https://valid-url-3.jpg"
+    ]
+  }
+}
+```
+
+**Partial Success**:
+- If some images fail validation: proceed with valid images
+- Set `partialSuccess=true` and add to `warnings` array
+- Example: `["Image 2 failed validation: 404 Not Found"]`
+
+**Image Proxy** (if `ENABLE_IMAGE_PROXY=true`):
+- For private/presigned URLs that may expire
+- Server downloads image → re-uploads to Webflow or CDN
+- Returns permanent URL
+- More complex (requires storage), only enable if needed
+
+### 8.6 Status Behavior
+
+**Purpose**: Handle lifecycle states (active → sold → archived)
+
+**Configuration**:
+```json
+{
+  "statusBehavior": {
+    "sold": {
+      "archive": true     // Set _archived=true in Webflow
+    },
+    "deleted": {
+      "delete": true      // Hard delete from Webflow (if enabled)
+    },
+    "draft": {
+      "draft": true       // Set _draft=true in Webflow
+    }
+  }
+}
+```
+
+**Processing**:
+1. Check if payload has status field (e.g., `data.status = "sold"`)
+2. Look up status in `statusBehavior` config
+3. Apply behavior:
+   - `archive: true` → Add `_archived: true` to fieldData
+   - `delete: true` → Call DELETE endpoint instead of PATCH
+   - `draft: true` → Add `_draft: true` to fieldData
+
+**Delete Behavior**:
+- If `connection.deleteOnRemove = true`: hard delete (DELETE /items/{id})
+- Else: soft delete (set `_archived=true`)
+- Default: soft delete (safer)
+
+**Example Flow**:
+```
+SmartSuite: status changed to "sold"
+  ↓
+statusBehavior: { "sold": { "archive": true } }
+  ↓
+Webflow PATCH: { fieldData: { ..., _archived: true } }
+  ↓
+Item archived but still accessible at detail page URL
+```
+
+### 8.7 Validation Before Webflow Call
+
+**Required Fields Check**:
+- Mapping has `requiredFields: ["name", "slug"]`
+- Before calling Webflow API, verify all required fields have values
+- If missing: fail event with error `"Missing required field: name"`
+
+**Type Validation**:
+- Number fields: ensure value is numeric (not string "123")
+- Boolean fields: ensure value is `true` or `false` (not "true")
+- Reference fields: ensure value is string or array of strings
+- Image fields: ensure URL is accessible
+
+**Slug Validation**:
+- Must be lowercase, alphanumeric, hyphens only
+- No spaces, special characters
+- Max length 100 chars (Webflow limit)
+- Apply slug transformation: `kebabCase(name).substring(0, 100)`
+
+**Example Validation Failure**:
+```json
+{
+  "status": "failed",
+  "error": "Validation failed: Field 'price' must be a number, got string \"99.99\"",
+  "attempts": 1,
+  "retriable": false
+}
+```
+
+---
+
+## 9) Queue & Worker System
+
+### 9.1 Queue Architecture
+
+**Why Queue?**
+- Webflow API has rate limits (60 req/min per token)
+- Batch processing more efficient than one-by-one
+- Retry logic easier with queue
+- Prevents thundering herd (many webhooks at once)
+
+**Database as Queue**:
+- No separate queue infrastructure (Redis, SQS, etc.)
+- Events table IS the queue
+- Status field indicates queue position:
+  - `queued`: ready to process
+  - `processing`: being worked on
+  - `failed` with `retryAfter`: waiting for retry
+
+**Why Not Redis/Bull?**
+- Adds complexity (another service to manage)
+- Database queue adequate for volume (<10k events/hour)
+- Easier debugging (can query events table directly)
+- No message loss (persistent storage)
+- Can migrate to Redis later if needed
+
+### 9.2 Worker Process
+
+**Trigger**: Vercel Cron (runs every 1 minute)
+
+**Cron Configuration** (`vercel.json`):
+```json
+{
+  "crons": [
+    {
+      "path": "/api/jobs/ingest",
+      "schedule": "* * * * *"
+    }
+  ]
+}
+```
+
+**Worker Algorithm**:
+
+```
+1. Verify CRON_SECRET (header: Authorization: Bearer {secret})
+2. Try to acquire distributed lock "worker:ingest"
+   - If locked: return 423 (another worker running)
+   - If acquired: proceed
+3. Query events:
+   SELECT * FROM events
+   WHERE (status = 'queued' OR (status = 'failed' AND retryAfter <= NOW()))
+     AND connection.status = 'active'
+   ORDER BY queuedAt ASC
+   LIMIT {WORKER_BATCH_SIZE}
+4. For each event (parallel up to 10 concurrent):
+   a. Update status='processing', attempts++
+   b. Load connection + mapping
+   c. Decrypt credentials
+   d. Process event (normalize → transform → upsert)
+   e. Update event status (success/failed/dead_letter)
+   f. Update analytics counters
+5. Release lock
+6. Return summary:
+   {
+     processed: 25,
+     succeeded: 23,
+     failed: 2,
+     durationMs: 4500
+   }
+```
+
+**Concurrency**:
+- Process up to 10 events in parallel
+- Use `p-limit(10)` for controlled parallelism
+- Each event still queued via per-connection rate limiter
+- Total worker duration <5 minutes (Vercel limit)
+
+**Batch Size**:
+- Default: 25 events per run
+- Configurable via `WORKER_BATCH_SIZE`
+- If queue is large (>100 events), worker will process 25 per minute
+- For 100 events: takes ~4 minutes to clear queue
+
+**Performance Example**:
+```
+Scenario: 60 events queued
+
+Run 1 (00:00): Process 25 → 35 remaining
+Run 2 (00:01): Process 25 → 10 remaining
+Run 3 (00:02): Process 10 → 0 remaining
+
+Total time: 2 minutes
+```
+
+### 9.3 Distributed Lock
+
+**Purpose**: Prevent multiple workers from processing same events
+
+**Implementation**: PostgreSQL table `distributed_locks`
+
+**Acquire Lock**:
+```sql
+-- Try to create lock row
+INSERT INTO distributed_locks (id, acquiredBy, expiresAt)
+VALUES ('worker:ingest', '{processId}', NOW() + INTERVAL '5 minutes')
+ON CONFLICT (id) DO NOTHING
+RETURNING *;
+
+-- If no rows returned, lock already held
+```
+
+**Alternative: Take Over Expired Lock**:
+```sql
+-- Check if lock exists and is expired
+SELECT * FROM distributed_locks
+WHERE id = 'worker:ingest' AND expiresAt < NOW();
+
+-- If found, update to take over
+UPDATE distributed_locks
+SET acquiredBy = '{processId}', acquiredAt = NOW(), expiresAt = NOW() + INTERVAL '5 minutes'
+WHERE id = 'worker:ingest' AND expiresAt < NOW();
+```
+
+**Release Lock**:
+```sql
+DELETE FROM distributed_locks
+WHERE id = 'worker:ingest' AND acquiredBy = '{processId}';
+```
+
+**Expiry**: 5 minutes (should be longer than max worker duration)
+
+**Process ID**: Generate with `nanoid()` to uniquely identify worker instance
+
+**Edge Case**: If worker crashes, lock auto-expires after 5 minutes
+
+### 9.4 Per-Connection Rate Limiting
+
+**Strategy**: Separate `p-queue` for each connection
+
+**Why Per-Connection?**
+- Different connections may have different rate limits
+- One slow connection doesn't block others
+- Easier to debug which connection is having issues
+
+**Queue Configuration**:
+```typescript
+const queue = new PQueue({
+  interval: 60_000,                    // 1 minute window
+  intervalCap: connection.rateLimitPerMin,  // e.g., 50
+  carryoverConcurrencyCount: true,     // Spread tasks over interval
+  timeout: 30_000,                     // 30s timeout per task
+});
+```
+
+**Queue Lifecycle**:
+- Create queue on first use for a connection
+- Cache in memory (Map<connectionId, PQueue>)
+- Cleanup idle queues every 10 minutes
+
+**Usage**:
+```typescript
+await connectionQueue.add(async () => {
+  return fetch(webflowApiUrl, { ... });
+});
+```
+
+**Benefits**:
+- Automatic spacing of requests over time
+- Prevents bursts that trigger rate limits
+- Built-in timeout handling
+
+### 9.5 Retry Strategy
+
+**Exponential Backoff with Jitter**:
+
+```
+Attempt 1: 0s (immediate)
+Attempt 2: 1s + jitter (±300ms)
+Attempt 3: 2s + jitter
+Attempt 4: 4s + jitter
+Attempt 5: 8s + jitter
+Attempt 6: Mark as dead_letter (maxRetries=5)
+```
+
+**Formula**:
+```typescript
+const baseBackoff = connection.retryBackoffMs;  // Default 1000ms
+const backoffMs = Math.min(
+  baseBackoff * Math.pow(2, attempt - 1),
+  env.MAX_RETRY_BACKOFF_MS  // Cap at 60s
+);
+const jitter = Math.random() * 0.3 * backoffMs;  // ±30% jitter
+const retryAfter = new Date(Date.now() + backoffMs + jitter);
+```
+
+**Why Jitter?**
+- Prevents "thundering herd" (many retries at exact same time)
+- Spreads load more evenly
+- Reduces collision probability
+
+**Retry Decision**:
+```typescript
+function isRetriable(error: Error): boolean {
+  // Network errors
+  if (error.message.includes('ECONNREFUSED')) return true;
+  if (error.message.includes('ETIMEDOUT')) return true;
+  if (error.message.includes('socket hang up')) return true;
+  
+  // HTTP errors
+  const status = extractStatusCode(error);
+  if (status === 429) return true;  // Rate limit
+  if (status >= 500) return true;   // Server error
+  if (status === 408) return true;  // Timeout
+  
+  // Validation errors (non-retriable)
+  if (status === 400) return false;
+  if (status === 401) return false;
+  if (status === 403) return false;
+  if (status === 422) return false;
+  
+  // Default: non-retriable
+  return false;
+}
+```
+
+**Using p-retry**:
+```typescript
+import pRetry from 'p-retry';
+
+await pRetry(
+  async () => {
+    const response = await fetch(url, options);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return response.json();
+  },
+  {
+    retries: connection.maxRetries,
+    minTimeout: connection.retryBackoffMs,
+    maxTimeout: env.MAX_RETRY_BACKOFF_MS,
+    factor: 2,
+    randomize: true,  // Adds jitter
+    onFailedAttempt: (error) => {
+      logger.warn({
+        attempt: error.attemptNumber,
+        retriesLeft: error.retriesLeft,
+      }, 'Retry attempt failed');
+    }
+  }
+);
+```
+
+### 9.6 Dead Letter Queue
+
+**When Event Becomes Dead Letter**:
+- Non-retriable error (400, 401, 403, 422)
+- Exhausted max retries (5 attempts by default)
+
+**Actions**:
+1. Update event: `status='dead_letter'`, `error={message}`, `errorStack={stack}`
+2. Increment connection.consecutiveErrors
+3. If consecutiveErrors >= 10: set connection.status='error'
+4. Log error with context for alerting
+
+**Manual Intervention**:
+- Admin reviews dead letter events in dashboard
+- Investigates error (invalid mapping, missing field, etc.)
+- Fixes issue (update mapping, add field, etc.)
+- Clicks "Replay" button → resets event to `queued`, `attempts=0`
+
+**Dashboard Display**:
+- Dead letter inbox (filterable)
+- Error message prominently displayed
+- Link to connection/mapping config
+- Payload viewer (JSON prettified)
+- Replay button (confirmation modal)
+
+### 9.7 Worker Monitoring
+
+**Metrics to Track**:
+- Events processed per run
+- Success/failure ratio
+- Average processing time
+- Queue depth (events in queued status)
+- Oldest queued event age
+
+**Health Indicators**:
+- Queue growing: incoming webhooks > processing rate
+- High failure rate: connection/mapping issue
+- Old queued events: worker not running or locked
+
+**Alerting Thresholds**:
+- Queue depth >100 for >5 minutes → alert
+- Success rate <90% for >1 hour → alert
+- Worker hasn't run in >5 minutes → alert
+
+**Logging**:
+```json
+{
+  "level": "info",
+  "msg": "Worker completed",
+  "processed": 25,
+  "succeeded": 23,
+  "failed": 2,
+  "durationMs": 4500,
+  "queueDepth": 75,
+  "oldestEventAge": 120
+}
+```
+
+---
+
+## 10) Mapping Engine Specification
+
+### 10.1 Field Mapping Types
+
+**1. Direct Mapping**:
+- Simplest: field → field
+- Example: SmartSuite `sku` → Webflow `sku`
+
+**Configuration**:
+```json
+{
+  "sku": {
+    "type": "direct",
+    "source": "$.sku"
+  }
+}
+```
+
+**2. JSONata Expression**:
+- Complex transformations using JSONata syntax
+- Example: Calculate discounted price
+
+**Configuration**:
+```json
+{
+  "sale_price": {
+    "type": "jsonata",
+    "expression": "$.price * 0.9"
+  }
+}
+```
+
+**More Examples**:
+```json
+{
+  "full_name": {
+    "type": "jsonata",
+    "expression": "$.first_name & ' ' & $.last_name"
+  },
+  "formatted_price": {
+    "type": "jsonata",
+    "expression": "'$' & $string($.price)"
+  },
+  "first_image": {
+    "type": "jsonata",
+    "expression": "$.images[0].url"
+  },
+  "tag_names": {
+    "type": "jsonata",
+    "expression": "$.tags.name"  // Extract name from array of objects
+  }
+}
+```
+
+**3. Template**:
+- String templates with placeholders
+- Example: Generate description from multiple fields
+
+**Configuration**:
+```json
+{
+  "description": {
+    "type": "template",
+    "template": "{{name}} - {{category}} - {{condition}}"
+  }
+}
+```
+
+**With Transforms**:
+```json
+{
+  "title": {
+    "type": "template",
+    "template": "{{uppercase(sku)}} - {{title(name)}}"
+  }
+}
+```
+
+**4. Constant**:
+- Always set to fixed value
+- Example: Set all synced items as "active"
+
+**Configuration**:
+```json
+{
+  "status": {
+    "type": "constant",
+    "value": "active"
+  }
+}
+```
+
+**5. Reference**:
+- Convert external ID to Webflow item ID via IdMap
+- Example: Category reference
+
+**Configuration**:
+```json
+{
+  "category": {
+    "type": "reference",
+    "source": "$.category[0].id",
+    "lookupBy": "externalId"
+  }
+}
+```
+
+### 10.2 Transform Functions
+
+**Available in Templates and as Post-Processing**:
+
+```typescript
+const TRANSFORMS = {
+  // Case transforms
+  uppercase: (str) => str.toUpperCase(),
+  lowercase: (str) => str.toLowerCase(),
+  title: (str) => str.replace(/\w\S*/g, t => t.charAt(0).toUpperCase() + t.slice(1).toLowerCase()),
+  
+  // Case changes (use change-case library)
+  camel: (str) => camelCase(str),
+  pascal: (str) => pascalCase(str),
+  snake: (str) => snakeCase(str),
+  kebab: (str) => kebabCase(str),
+  
+  // String manipulation
+  trim: (str) => str.trim(),
+  truncate: (str, len) => str.substring(0, len),
+  
+  // Encoding
+  urlencode: (str) => encodeURIComponent(str),
+  
+  // Numeric
+  round: (num, decimals = 0) => Math.round(num * Math.pow(10, decimals)) / Math.pow(10, decimals),
+  floor: (num) => Math.floor(num),
+  ceil: (num) => Math.ceil(num),
+  
+  // Date (use date-fns)
+  formatDate: (date, format = 'yyyy-MM-dd') => format(new Date(date), format),
+};
+```
+
+**Usage in Template**:
+```
+"{{kebab(name)}}"          → "product-name"
+"{{uppercase(sku)}}"       → "SKU-123"
+"{{truncate(description, 100)}}"  → "First 100 chars..."
+```
+
+**Usage as Post-Transform**:
+```json
+{
+  "name": {
+    "type": "direct",
+    "source": "$.title",
+    "transform": "title"
+  }
+}
+```
+
+### 10.3 Slug Generation
+
+**Purpose**: Auto-generate Webflow slug from SmartSuite data
+
+**Configuration**:
+```json
+{
+  "slugTemplate": "{{sku}}-{{kebab(name)}}"
+}
+```
+
+**Processing**:
+1. Render template with SmartSuite data
+2. Apply `kebabCase()` transformation
+3. Remove special characters (keep alphanumeric + hyphens)
+4. Truncate to 100 chars (Webflow limit)
+5. Check for slug collision (query Webflow or cache)
+6. If collision: append `-{counter}` and retry
+
+**Example**:
+```
+Template: "{{sku}}-{{kebab(name)}}"
+Data: { sku: "WDG-001", name: "Widget Pro Max" }
+Result: "wdg-001-widget-pro-max"
+
+If collision:
+  "wdg-001-widget-pro-max-1"
+  "wdg-001-widget-pro-max-2"
+  etc.
+```
+
+**Default Slug** (if no template):
+- Use `kebabCase(name)` where `name` is the first PlainText field
+- Fallback: `item-{externalId}`
+
+### 10.4 Auto-Mapping Algorithm
+
+**Goal**: Suggest initial mappings based on field similarity
+
+**Algorithm**:
+```
+For each Webflow field:
+  1. Find SmartSuite fields with similar names
+     - Exact match (case-insensitive): 100% score
+     - Substring match: 80% score
+     - Levenshtein distance <3: 60% score
+  
+  2. Filter by type compatibility
+     - Check FIELD_TYPE_COMPATIBILITY matrix
+     - Keep only compatible SmartSuite fields
+  
+  3. If single match with score >80%:
+     - Auto-map as "direct"
+     - Set source to SmartSuite field
+  
+  4. If multiple matches:
+     - Rank by score
+     - Suggest top match
+     - Show alternatives in dropdown
+  
+  5. If no match:
+     - Leave unmapped
+     - Show all compatible fields in dropdown
+```
+
+**Examples**:
+
+| Webflow Field | SmartSuite Fields | Auto-Map? | Reasoning |
+|---------------|------------------|-----------|-----------|
+| name | title | ✅ | High similarity (title ≈ name) |
+| sku | sku | ✅ | Exact match |
+| price | price, cost | ✅ price | Exact match for "price" |
+| slug | - | ❌ | No similar field (will use template) |
+| category | category_id | ✅ | Substring match + reference type |
+
+### 10.5 Mapping Validation
+
+**Before Saving Mapping**:
+
+1. **Required Fields Check**:
+   - Query Webflow collection schema
+   - Identify fields with `isRequired=true`
+   - Verify all required fields are mapped
+   - If missing: show error "Missing required field: {field}"
+
+2. **Type Compatibility**:
+   - Verify each mapping uses compatible types
+   - Example: SmartSuite "textfield" → Webflow "Number" is INVALID
+   - Show warning if types don't match
+
+3. **JSONata Syntax**:
+   - Parse JSONata expressions
+   - Catch syntax errors
+   - Test against sample data
+   - Show result or error
+
+4. **Template Syntax**:
+   - Verify all placeholders reference valid fields
+   - Example: `{{invalid_field}}` → error
+   - Test rendering with sample data
+
+5. **Reference Validity**:
+   - Verify referenced collections exist
+   - Verify lookupBy field exists in IdMap
+   - Warn if no IdMap entries found (may be OK if first sync)
+
+**During Processing**:
+
+1. **Runtime Validation**:
+   - Check field types match expected
+   - Coerce types when safe (string "123" → number 123)
+   - Fail if coercion impossible
+
+2. **Required Field Enforcement**:
+   - After applying all mappings, check if required fields have values
+   - If missing: fail event with clear error
+
+**Validation Errors**:
+```json
+{
+  "valid": false,
+  "errors": [
+    {
+      "field": "price",
+      "message": "Type mismatch: SmartSuite 'textfield' cannot map to Webflow 'Number'"
+    },
+    {
+      "field": "slug",
+      "message": "Template placeholder '{{invalid}}' references non-existent field"
+    }
+  ],
+  "warnings": [
+    {
+      "field": "category",
+      "message": "No IdMap entries found for category references. This will fail until categories are synced first."
+    }
+  ]
+}
+```
+
+### 10.6 Test Mode / Preview
+
+**Purpose**: Test mapping with sample data before saving
+
+**Flow**:
+1. Admin provides sample SmartSuite record (paste JSON or fetch from API)
+2. System applies mapping transformations
+3. Shows result in three columns:
+   - **Input**: SmartSuite data (prettified JSON)
+   - **Mapped**: Intermediate representation
+   - **Output**: Webflow fieldData (what will be sent to API)
+4. Shows any errors or warnings
+5. Optional: "Test Upsert" button to actually create/update item in Webflow
+
+**UI Layout**:
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Test Mapping                                                   │
+├─────────────────────────────────────────────────────────────────┤
+│  Sample Data: [Fetch from SmartSuite ▼] [Paste JSON]           │
+│  ┌───────────────────────────────────────────────────────────┐ │
+│  │ {                                                          │ │
+│  │   "sku": "WDG-001",                                       │ │
+│  │   "title": "Widget Pro",                                  │ │
+│  │   "price": 99.99,                                         │ │
+│  │   "images": [...]                                         │ │
+│  │ }                                                          │ │
+│  └───────────────────────────────────────────────────────────┘ │
+│                                                                 │
+│  [Apply Mapping]                                                │
+│                                                                 │
+│  ┌────────────────┬──────────────────┬───────────────────────┐ │
+│  │ Input          │ Mapping          │ Output                │ │
+│  ├────────────────┼──────────────────┼───────────────────────┤ │
+│  │ sku: WDG-001   │ direct           │ sku: "WDG-001"        │ │
+│  │ title: Widget..│ direct           │ name: "Widget Pro"    │ │
+│  │ price: 99.99   │ jsonata          │ sale-price: 89.99     │ │
+│  │ images: [...]  │ image mapping    │ product-image: "http..│ │
+│  │                │ slug template    │ slug: "wdg-001-widget"│ │
+│  └────────────────┴──────────────────┴───────────────────────┘ │
+│                                                                 │
+│  ✅ Validation passed. Ready to sync.                          │
+│                                                                 │
+│  [Test Upsert to Webflow]  [Save Mapping]                     │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Test Upsert**:
+- Actually calls Webflow API with test data
+- Shows success/failure result
+- Shows returned Webflow item
+- Does NOT create IdMap entry (to avoid pollution)
+- Use connection's real credentials
+
+### 10.7 Diff Viewer (Item Inspector)
+
+**Purpose**: Show what changed between syncs
+
+**Display**:
+```
+Sync #12 → Sync #13 (2024-10-13 10:30:00)
+
+┌────────────────────────────────────────────────────────────┐
+│ Field         │ Before           │ After                   │
+├───────────────┼──────────────────┼─────────────────────────┤
+│ name          │ Widget Pro       │ Widget Pro              │ (no change)
+│ price         │ 99.99            │ 89.99                   │ ⚠️ Changed
+│ status        │ active           │ sold                    │ ⚠️ Changed
+│ product-image │ http://old.jpg   │ http://new.jpg          │ ⚠️ Changed
+└────────────────────────────────────────────────────────────┘
+
+Changes: 3 fields updated
+```
+
+**Implementation**:
+- Store snapshot of `fieldData` in IdMap.externalData on each sync
+- On next sync, compare old vs new
+- Highlight changed fields
+- Use deep diff for nested objects/arrays
+
+---
+
+## 11) Dashboard UI Requirements
+
+### 11.1 Authentication Page
+
+**Route**: `/admin/login`
+
+**Layout**:
+```
+┌─────────────────────────────────────────────────────────────┐
+│                                                             │
+│                   ⚡ SmartSuite ↔ Webflow                  │
+│                        Sync Admin                           │
+│                                                             │
+│               ┌───────────────────────────┐                 │
+│               │ Password                  │                 │
+│               │ [••••••••••••••••••••••] │                 │
+│               │                           │                 │
+│               │ [Sign In]                │                 │
+│               └───────────────────────────┘                 │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Features**:
+- Single password field (no username)
+- "Sign In" button (disabled until password entered)
+- Show error message on failed login
+- Redirect to `/admin` on success
+- Remember me (extend session to 30 days)
+
+**Error Messages**:
+- "Invalid password. Please try again."
+- "Too many failed attempts. Please wait 5 minutes."
+
+### 11.2 Overview Dashboard
+
+**Route**: `/admin`
+
+**Layout**:
+```
+┌─────────────────────────────────────────────────────────────┐
+│ SmartSuite ↔ Webflow Sync Admin              [Brady ▼] │
+├─────────────────────────────────────────────────────────────┤
+│ [Overview] [Connections] [Events] [Items] [Settings]       │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│ ┌──────────────────────────────────────────────────────┐   │
+│ │ Last 24 Hours                                        │   │
+│ │ ┌───────────┬───────────┬───────────┬───────────┐  │   │
+│ │ │ Total     │ Success   │ Failed    │ Success % │  │   │
+│ │ │ 1,247     │ 1,235     │ 12        │ 99.0%     │  │   │
+│ │ └───────────┴───────────┴───────────┴───────────┘  │   │
+│ └──────────────────────────────────────────────────────┘   │
+│                                                             │
+│ ┌──────────────────────────────────────────────────────┐   │
+│ │ Event Volume (Last 7 Days)                          │   │
+│ │ [Line chart showing events per day]                 │   │
+│ └──────────────────────────────────────────────────────┘   │
+│                                                             │
+│ ┌──────────────────────────────────────────────────────┐   │
+│ │ Active Connections                                   │   │
+│ │ ┌────────────────────────────────────────────────┐  │   │
+│ │ │ Name              Status  Last Success  Actions│  │   │
+│ │ ├────────────────────────────────────────────────┤  │   │
+│ │ │ Products → WF     ✓       2 min ago     [View] │  │   │
+│ │ │ Inventory → WF    ⚠️      1 hour ago    [View] │  │   │
+│ │ └────────────────────────────────────────────────┘  │   │
+│ └──────────────────────────────────────────────────────┘   │
+│                                                             │
+│ ┌──────────────────────────────────────────────────────┐   │
+│ │ Recent Errors                                        │   │
+│ │ • Field 'price' must be number (12 occurrences)     │   │
+│ │ • Rate limit exceeded (3 occurrences)               │   │
+│ │ • Webflow collection not found (1 occurrence)       │   │
+│ └──────────────────────────────────────────────────────┘   │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Metrics Cards**:
+- Total events (last 24h, 7d, 30d - tabs)
+- Success count
+- Failed count
+- Success percentage
+- P95 latency
+
+**Charts** (using Recharts):
+- Line chart: Events per day (last 7d or 30d)
+- Bar chart: Events by connection
+- Pie chart: Event status distribution
+
+**Connections Table**:
+- Name
+- Status badge (active, paused, error)
+- Last success timestamp (relative: "2 min ago")
+- Actions: View, Edit, Pause/Resume
+
+**Recent Errors**:
+- Top 5 most common errors
+- Count of occurrences
+- Link to filtered events list
+
+### 11.3 Connections List
+
+**Route**: `/admin/connections`
+
+**Layout**:
+```
+┌─────────────────────────────────────────────────────────────┐
+│ Connections                    [+ New Connection]           │
+├─────────────────────────────────────────────────────────────┤
+│ [Search...]                    Filter: [All ▼]              │
+│                                                             │
+│ ┌─────────────────────────────────────────────────────────┐│
+│ │ Name              Source     Target      Status  Actions││
+│ ├─────────────────────────────────────────────────────────┤│
+│ │ Products Sync     SmartSuite Webflow     ✓       [•••] ││
+│ │ Inventory Sync    SmartSuite Webflow     ⚠️      [•••] ││
+│ │ Categories Sync   SmartSuite Webflow     ⏸       [•••] ││
+│ └─────────────────────────────────────────────────────────┘│
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Features**:
+- Search by name
+- Filter by status (all, active, paused, error, archived)
+- Sort by: name, last success, created date
+- Actions dropdown:
+  - View Details
+  - Edit Mapping
+  - Pause/Resume
+  - Test Webhook
+  - Delete (with confirmation)
+
+**Status Badges**:
+- 🟢 Active (green)
+- 🟡 Paused (yellow)
+- 🔴 Error (red)
+- ⚪ Archived (gray)
+
+### 11.4 Connection Detail Page
+
+**Route**: `/admin/connections/[id]`
+
+**Layout**:
+```
+┌─────────────────────────────────────────────────────────────┐
+│ ← Back to Connections                                       │
+│                                                             │
+│ Products Sync                              [Edit] [Pause]   │
+│ Status: ✓ Active                                           │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│ ┌──────────────────────────────────────────────────────┐   │
+│ │ Configuration                                        │   │
+│ │ Source: SmartSuite                                   │   │
+│ │   Base: Product Management (solution_abc123)         │   │
+│ │   Table: Products (app_xyz789)                       │   │
+│ │                                                      │   │
+│ │ Target: Webflow                                      │   │
+│ │   Site: My Store (site_abc123)                      │   │
+│ │   Collection: Products (col_xyz789)                  │   │
+│ │                                                      │   │
+│ │ Rate Limit: 50 requests/minute                       │   │
+│ │ Max Retries: 5                                       │   │
+│ └──────────────────────────────────────────────────────┘   │
+│                                                             │
+│ ┌──────────────────────────────────────────────────────┐   │
+│ │ Webhook Configuration                                │   │
+│ │ URL: https://sync.app/api/hooks/conn_123           │   │
+│ │ Secret: ••••••••••••••••• [Show] [Regenerate]      │   │
+│ │                                                      │   │
+│ │ [Test Webhook] [Copy URL]                           │   │
+│ └──────────────────────────────────────────────────────┘   │
+│                                                             │
+│ ┌──────────────────────────────────────────────────────┐   │
+│ │ Field Mapping (12 fields mapped)                    │   │
+│ │ ┌────────────────────────────────────────────────┐  │   │
+│ │ │ Webflow Field    SmartSuite Source   Type      │  │   │
+│ │ ├────────────────────────────────────────────────┤  │   │
+│ │ │ name            → title             direct     │  │   │
+│ │ │ slug            → (template)        template   │  │   │
+│ │ │ sku             → sku               direct     │  │   │
+│ │ │ price           → price * 1.1       jsonata    │  │   │
+│ │ │ ...                                            │  │   │
+│ │ └────────────────────────────────────────────────┘  │   │
+│ │ [Edit Mapping]                                       │   │
+│ └──────────────────────────────────────────────────────┘   │
+│                                                             │
+│ ┌──────────────────────────────────────────────────────┐   │
+│ │ Recent Events (Last 24 hours)                       │   │
+│ │ Total: 247 | Success: 245 | Failed: 2              │   │
+│ │ [View All Events]                                    │   │
+│ └──────────────────────────────────────────────────────┘   │
+│                                                             │
+│ ┌──────────────────────────────────────────────────────┐   │
+│ │ Performance (Last 7 days)                           │   │
+│ │ [Line chart: events per day]                        │   │
+│ │ P95 Latency: 2.3s                                   │   │
+│ └──────────────────────────────────────────────────────┘   │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Actions**:
+- Edit: Go to mapping wizard (pre-filled)
+- Pause/Resume: Toggle connection status
+- Test Webhook: Send test payload, show result
+- Delete: Soft delete (archive) with confirmation
+
+**Test Webhook Modal**:
+```
+┌─────────────────────────────────────────────────────┐
+│ Test Webhook                                   [×] │
+├─────────────────────────────────────────────────────┤
+│                                                     │
+│ This will fetch a sample record from SmartSuite    │
+│ and process it as if a real webhook was received.  │
+│                                                     │
+│ [Fetch Random Record]  [Use Custom JSON]           │
+│                                                     │
+│ ┌─────────────────────────────────────────────┐   │
+│ │ {                                            │   │
+│ │   "record_id": "rec_abc123",                │   │
+│ │   "data": { ... }                           │   │
+│ │ }                                            │   │
+│ └─────────────────────────────────────────────┘   │
+│                                                     │
+│ [Cancel]                    [Send Test Webhook]    │
+└─────────────────────────────────────────────────────┘
+```
+
+### 11.5 Mapping Wizard (Multi-Step Form)
+
+**Route**: `/admin/connections/new` or `/admin/connections/[id]/edit`
+
+**Step 1: Credentials**
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ Create Connection - Step 1 of 7                     [×]     │
+├─────────────────────────────────────────────────────────────┤
+│ Connection Details                                          │
+│                                                             │
+│ Name *                                                      │
+│ [Products Sync                                          ]   │
+│                                                             │
+│ Description (optional)                                      │
+│ [Sync products from SmartSuite to Webflow store      ]   │
+│                                                             │
+├─────────────────────────────────────────────────────────────┤
+│ SmartSuite API Credentials                                 │
+│                                                             │
+│ API Key *                                                   │
+│ [••••••••••••••••••••••••••••••••••••]  [Show]            │
+│                                                             │
+│ [Test Connection] ✓ Connection successful                  │
+│                                                             │
+├─────────────────────────────────────────────────────────────┤
+│ Webflow API Credentials                                    │
+│                                                             │
+│ Personal Access Token *                                     │
+│ [••••••••••••••••••••••••••••••••••••]  [Show]            │
+│                                                             │
+│ [Test Connection] ✓ Connection successful                  │
+│                                                             │
+├─────────────────────────────────────────────────────────────┤
+│                                   [Cancel]     [Next →]    │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Validation**:
+- Name required, 1-100 chars
+- API keys required
+- Test connection before allowing Next
+- Show error if connection fails
+- Credentials encrypted before storing
+
+**Step 2: Source Selection**
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ Create Connection - Step 2 of 7                            │
+├─────────────────────────────────────────────────────────────┤
+│ Select SmartSuite Source                                   │
+│                                                             │
+│ Solution (Base) *                                           │
+│ [Product Management                                    ▼]   │
+│                                                             │
+│ Application (Table) *                                       │
+│ [Products                                              ▼]   │
+│                                                             │
+│ ┌─────────────────────────────────────────────────────┐   │
+│ │ Available Fields (15)                                │   │
+│ │ ┌───────────────────────────────────────────────┐  │   │
+│ │ │ Slug          Label           Type             │  │   │
+│ │ ├───────────────────────────────────────────────┤  │   │
+│ │ │ title         Product Name    textfield        │  │   │
+│ │ │ sku           SKU             textfield        │  │   │
+│ │ │ price         Price           numberfield      │  │   │
+│ │ │ description   Description     textarea         │  │   │
+│ │ │ status        Status           statusfield     │  │   │
+│ │ │ images        Images           files           │  │   │
+│ │ │ category      Category         linkedrecord    │  │   │
+│ │ │ ...                                            │  │   │
+│ │ └───────────────────────────────────────────────┘  │   │
+│ └─────────────────────────────────────────────────────┘   │
+│                                                             │
+├─────────────────────────────────────────────────────────────┤
+│                          [← Back]       [Next →]           │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Features**:
+- Dropdowns populated from API discovery
+- Show all available fields in table
+- Search/filter fields
+- Indicate field types with icons
+
+**Step 3: Target Selection**
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ Create Connection - Step 3 of 7                            │
+├─────────────────────────────────────────────────────────────┤
+│ Select Webflow Target                                      │
+│                                                             │
+│ Site *                                                      │
+│ [My Store                                              ▼]   │
+│                                                             │
+│ Collection *                                                │
+│ [Products                                              ▼]   │
+│                                                             │
+│ ┌─────────────────────────────────────────────────────┐   │
+│ │ Available Fields (18)                                │   │
+│ │ ┌───────────────────────────────────────────────┐  │   │
+│ │ │ Slug          Label           Type   Required │  │   │
+│ │ ├───────────────────────────────────────────────┤  │   │
+│ │ │ name          Name            PlainText   ✓   │  │   │
+│ │ │ slug          Slug            PlainText   ✓   │  │   │
+│ │ │ sku           SKU             PlainText       │  │   │
+│ │ │ price         Price           Number          │  │   │
+│ │ │ description   Description     RichText        │  │   │
+│ │ │ status        Status          Option          │  │   │
+│ │ │ product-image Image           Image           │  │   │
+│ │ │ gallery       Gallery         MultiImage      │  │   │
+│ │ │ category      Category        Reference       │  │   │
+│ │ │ ...                                            │  │   │
+│ │ └───────────────────────────────────────────────┘  │   │
+│ └─────────────────────────────────────────────────────┘   │
+│                                                             │
+├─────────────────────────────────────────────────────────────┤
+│                          [← Back]       [Next →]           │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Features**:
+- Show required fields with indicator
+- Show field types
+- Highlight incompatible types (grayed out)
+
+**Step 4: Auto-Map Fields**
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ Create Connection - Step 4 of 7                            │
+├─────────────────────────────────────────────────────────────┤
+│ Map Fields                                                  │
+│                                                             │
+│ [Auto-Map Similar Fields]  12 fields auto-mapped           │
+│                                                             │
+│ ┌─────────────────────────────────────────────────────────┐│
+│ │ Webflow Field    Source                    Type      ⚙️ ││
+│ ├─────────────────────────────────────────────────────────┤│
+│ │ name *          [title                    ▼] direct  [⚙️]││
+│ │ slug *          [Auto-generate            ▼] template[⚙️]││
+│ │ sku             [sku                      ▼] direct  [⚙️]││
+│ │ price           [price                    ▼] direct  [⚙️]││
+│ │ description     [description              ▼] direct  [⚙️]││
+│ │ product-image   [images[0]                ▼] jsonata [⚙️]││
+│ │ gallery         [images                   ▼] jsonata [⚙️]││
+│ │ category        [category                 ▼] reference[⚙️]││
+│ │ status          [Unmapped                 ▼] -       [⚙️]││
+│ └─────────────────────────────────────────────────────────┘│
+│                                                             │
+│ ⚙️ Click to configure advanced mapping (JSONata, templates) │
+│                                                             │
+├─────────────────────────────────────────────────────────────┤
+│                          [← Back]       [Next →]           │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Features**:
+- Auto-map button runs similarity algorithm
+- Show mapping type for each field
+- Dropdown shows compatible SmartSuite fields
+- Gear icon opens advanced config modal
+- Required fields highlighted
+- Show warning if required field unmapped
+
+**Advanced Mapping Modal** (when clicking ⚙️):
+
+```
+┌─────────────────────────────────────────────────────┐
+│ Configure Field: price                         [×] │
+├─────────────────────────────────────────────────────┤
+│                                                     │
+│ Mapping Type                                        │
+│ ◉ Direct        ○ JSONata   ○ Template   ○ Constant│
+│                                                     │
+│ Source Field                                        │
+│ [price                                         ▼]   │
+│                                                     │
+│ Transform (optional)                                │
+│ [None                                          ▼]   │
+│                                                     │
+│ Default Value (if source is null)                  │
+│ [0                                              ]   │
+│                                                     │
+│ ┌─────────────────────────────────────────────┐   │
+│ │ Preview                                      │   │
+│ │ Input:  99.99                               │   │
+│ │ Output: 99.99                               │   │
+│ └─────────────────────────────────────────────┘   │
+│                                                     │
+│ [Cancel]                            [Save]         │
+└─────────────────────────────────────────────────────┘
+```
+
+**For JSONata Type**:
+
+```
+┌─────────────────────────────────────────────────────┐
+│ Configure Field: sale_price                    [×] │
+├─────────────────────────────────────────────────────┤
+│                                                     │
+│ Mapping Type                                        │
+│ ○ Direct        ◉ JSONata   ○ Template   ○ Constant│
+│                                                     │
+│ JSONata Expression                                  │
+│ [$.price * 0.9                                  ]   │
+│                                                     │
+│ ┌─────────────────────────────────────────────┐   │
+│ │ Preview                                      │   │
+│ │ Input:  { price: 99.99 }                    │   │
+│ │ Output: 89.99                               │   │
+│ │ ✓ Valid JSONata expression                  │   │
+│ └─────────────────────────────────────────────┘   │
+│                                                     │
+│ [JSONata Help]  [Cancel]             [Save]        │
+└─────────────────────────────────────────────────────┘
+```
+
+**Step 5: Configure Transforms**
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ Create Connection - Step 5 of 7                            │
+├─────────────────────────────────────────────────────────────┤
+│ Slug Generation                                             │
+│                                                             │
+│ ☑ Auto-generate slugs                                      │
+│                                                             │
+│ Template                                                    │
+│ [{{sku}}-{{kebab(title)}}                              ]   │
+│                                                             │
+│ Preview: wdg-001-widget-pro                                │
+│                                                             │
+├─────────────────────────────────────────────────────────────┤
+│ Status Behavior                                             │
+│                                                             │
+│ When status is "sold":                                     │
+│ ☑ Archive item in Webflow                                  │
+│ ☐ Delete item from Webflow                                 │
+│                                                             │
+│ When status is "archived":                                 │
+│ ☑ Archive item in Webflow                                  │
+│ ☐ Delete item from Webflow                                 │
+│                                                             │
+├─────────────────────────────────────────────────────────────┤
+│ Image Handling                                              │
+│                                                             │
+│ Primary Image: [images[0].url                         ▼]   │
+│ Gallery Images: [images[*].url                        ▼]   │
+│ Fallback Image URL: [https://...placeholder.jpg       ]   │
+│                                                             │
+│ ☑ Skip item creation if primary image invalid              │
+│                                                             │
+├─────────────────────────────────────────────────────────────┤
+│ Rate Limiting                                               │
+│                                                             │
+│ Max requests per minute: [50                          ]    │
+│ Max retry attempts: [5                                ]    │
+│ Initial retry backoff (ms): [1000                     ]    │
+│                                                             │
+├─────────────────────────────────────────────────────────────┤
+│                          [← Back]       [Next →]           │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Step 6: Test Mapping**
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ Create Connection - Step 6 of 7                            │
+├─────────────────────────────────────────────────────────────┤
+│ Test Your Mapping                                           │
+│                                                             │
+│ Sample Data: [Fetch from SmartSuite ▼] [Paste JSON]        │
+│                                                             │
+│ ┌─────────────────────────────────────────────────────┐   │
+│ │ SmartSuite Input                                     │   │
+│ │ ┌───────────────────────────────────────────────┐  │   │
+│ │ │ {                                              │  │   │
+│ │ │   "title": "Widget Pro",                      │  │   │
+│ │ │   "sku": "WDG-001",                          │  │   │
+│ │ │   "price": 99.99,                            │  │   │
+│ │ │   "images": [...]                            │  │   │
+│ │ │ }                                              │  │   │
+│ │ └───────────────────────────────────────────────┘  │   │
+│ └─────────────────────────────────────────────────────┘   │
+│                                                             │
+│ [Apply Mapping]                                             │
+│                                                             │
+│ ┌─────────────────────────────────────────────────────┐   │
+│ │ Webflow Output                                       │   │
+│ │ ┌───────────────────────────────────────────────┐  │   │
+│ │ │ {                                              │  │   │
+│ │ │   "name": "Widget Pro",                       │  │   │
+│ │ │   "slug": "wdg-001-widget-pro",              │  │   │
+│ │ │   "sku": "WDG-001",                          │  │   │
+│ │ │   "price": 99.99,                            │  │   │
+│ │ │   "product-image": "https://...",            │  │   │
+│ │ │   "gallery": ["https://..."]                 │  │   │
+│ │ │ }                                              │  │   │
+│ │ └───────────────────────────────────────────────┘  │   │
+│ └─────────────────────────────────────────────────────┘   │
+│                                                             │
+│ ✓ All required fields have values                          │
+│ ✓ No validation errors                                     │
+│                                                             │
+│ [Test Upsert to Webflow] ← Actually create item           │
+│                                                             │
+├─────────────────────────────────────────────────────────────┤
+│                          [← Back]       [Next →]           │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Features**:
+- Fetch real record from SmartSuite
+- Or paste custom JSON
+- Apply mapping and show result
+- Highlight validation errors
+- Optional: actually upsert to Webflow (test mode)
+- Show success/error from Webflow API
+
+**Step 7: Webhook Setup**
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ Create Connection - Step 7 of 7                            │
+├─────────────────────────────────────────────────────────────┤
+│ Webhook Configuration                                       │
+│                                                             │
+│ Your webhook URL:                                           │
+│ ┌─────────────────────────────────────────────────────┐   │
+│ │ https://sync.app/api/hooks/conn_abc123           │   │
+│ │                                         [Copy]      │   │
+│ └─────────────────────────────────────────────────────┘   │
+│                                                             │
+│ Webhook Secret (save this - shown only once):               │
+│ ┌─────────────────────────────────────────────────────┐   │
+│ │ wh_secret_xYz789AbC123DeF456                      │   │
+│ │                                         [Copy]      │   │
+│ └─────────────────────────────────────────────────────┘   │
+│                                                             │
+│ ⚠️ Save this secret! You'll need it to configure the      │
+│ webhook in SmartSuite.                                     │
+│                                                             │
+├─────────────────────────────────────────────────────────────┤
+│ Configure SmartSuite Webhook                               │
+│                                                             │
+│ 1. Go to SmartSuite → Settings → Automations → Webhooks   │
+│ 2. Create new webhook                                       │
+│ 3. Set URL: https://sync.app/api/hooks/conn_abc123       │
+│ 4. Add header: x-smartsuite-signature                      │
+│ 5. Set secret: wh_secret_xYz789AbC123DeF456               │
+│ 6. Select events: record_created, record_updated           │
+│                                                             │
+│ [View Full Instructions]                                    │
+│                                                             │
+├─────────────────────────────────────────────────────────────┤
+│                          [← Back]  [Create Connection]     │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Features**:
+- Generate unique webhook URL
+- Generate cryptographically secure secret
+- Show secret only once (store hash in DB)
+- Copy buttons for URL and secret
+- Step-by-step instructions
+- Link to full documentation
+
+**Success Screen**:
+
+```
+┌─────────────────────────────────────────────────────┐
+│                                                     │
+│                    ✓ Success!                       │
+│                                                     │
+│         Your connection is now active               │
+│                                                     │
+│  Start sending webhooks from SmartSuite to begin   │
+│  syncing data to Webflow.                          │
+│                                                     │
+│  [View Connection]  [Create Another]               │
+│                                                     │
+└─────────────────────────────────────────────────────┘
+```
+
+### 11.6 Events Inbox
+
+**Route**: `/admin/events`
+
+**Layout**:
+```
+┌─────────────────────────────────────────────────────────────┐
+│ Events                                                      │
+├─────────────────────────────────────────────────────────────┤
+│ [Search by ID...]                                           │
+│                                                             │
+│ Filters:                                                    │
+│ Status: [All ▼]  Connection: [All ▼]  Date: [Last 7d ▼]   │
+│                                                             │
+│ [Bulk Actions ▼]                                           │
+│                                                             │
+│ ┌─────────────────────────────────────────────────────────┐│
+│ │ □ Status    Connection     ID        Time     Duration ││
+│ ├─────────────────────────────────────────────────────────┤│
+│ │ □ ✓ Success Products       rec_123   2m ago   1.2s    ││
+│ │ □ ⏳ Queued  Products       rec_124   1m ago   -       ││
+│ │ □ ⚠️ Failed  Inventory      rec_125   5m ago   3.4s    ││
+│ │ □ 🔴 Dead    Products       rec_126   1h ago   -       ││
+│ │ □ ⏸ Skipped Products       rec_127   2h ago   -       ││
+│ └─────────────────────────────────────────────────────────┘│
+│                                                             │
+│ Pagination: [← Prev]  Page 1 of 42  [Next →]              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Features**:
+- Search by external ID or event ID
+- Filter by status, connection, date range
+- Sort by any column
+- Bulk actions:
+  - Retry selected (if failed)
+  - Mark as dead letter
+  - Export to CSV
+- Click row to view details
+
+**Event Detail Modal**:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ Event Details                                          [×] │
+├─────────────────────────────────────────────────────────────┤
+│ ID: evt_abc123                                   ✓ Success  │
+│ Connection: Products Sync                                   │
+│ External ID: rec_product_xyz                               │
+│                                                             │
+│ ┌─────────────────────────────────────────────────────┐   │
+│ │ Timeline                                             │   │
+│ │ ✓ Queued       2024-10-13 10:30:00                  │   │
+│ │ ✓ Processing   2024-10-13 10:31:00                  │   │
+│ │ ✓ Success      2024-10-13 10:31:02  (2.1s)         │   │
+│ └─────────────────────────────────────────────────────┘   │
+│                                                             │
+│ [Payload] [Transformed] [Webflow Response]                 │
+│ ┌─────────────────────────────────────────────────────┐   │
+│ │ {                                                    │   │
+│ │   "event_type": "record_updated",                   │   │
+│ │   "record_id": "rec_product_xyz",                   │   │
+│ │   "data": {                                          │   │
+│ │     "title": "Widget Pro",                          │   │
+│ │     "price": 99.99,                                 │   │
+│ │     ...                                              │   │
+│ │   }                                                  │   │
+│ │ }                                                    │   │
+│ └─────────────────────────────────────────────────────┘   │
+│                                                             │
+│ Webflow Item ID: wf_item_abc123                           │
+│ [View in Webflow]                                          │
+│                                                             │
+│ [Replay Event]                                [Close]      │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**For Failed/Dead Letter Events**:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ Event Details                                          [×] │
+├─────────────────────────────────────────────────────────────┤
+│ ID: evt_xyz789                                🔴 Dead Letter│
+│ Connection: Products Sync                                   │
+│ External ID: rec_product_abc                               │
+│                                                             │
+│ ┌─────────────────────────────────────────────────────┐   │
+│ │ Error                                                │   │
+│ │ Field 'price' must be a number, got string "99.99" │   │
+│ │                                                      │   │
+│ │ Attempts: 5                                          │   │
+│ │ Last attempt: 2024-10-13 10:45:00                   │   │
+│ └─────────────────────────────────────────────────────┘   │
+│                                                             │
+│ ┌─────────────────────────────────────────────────────┐   │
+│ │ Stack Trace                                          │   │
+│ │ at validateField (mapper.ts:123)                    │   │
+│ │ at buildWebflowBody (mapper.ts:456)                 │   │
+│ │ at processEvent (event-processor.ts:789)            │   │
+│ └─────────────────────────────────────────────────────┘   │
+│                                                             │
+│ [View Payload] [View Mapping]                              │
+│                                                             │
+│ ⚠️ Fix the mapping, then replay this event                │
+│                                                             │
+│ [Replay Event]                                [Close]      │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 11.7 Item Inspector
+
+**Route**: `/admin/items`
+
+**Layout**:
+```
+┌─────────────────────────────────────────────────────────────┐
+│ Item Inspector                                              │
+├─────────────────────────────────────────────────────────────┤
+│ Search by External ID or Webflow Item ID                   │
+│ [rec_product_123                                       ] 🔍 │
+│                                                             │
+│ Connection: [Products Sync                             ▼]  │
+│                                                             │
+├─────────────────────────────────────────────────────────────┤
+│ Item Found                                                  │
+│                                                             │
+│ External ID: rec_product_123                               │
+│ Webflow Item ID: wf_item_xyz789                            │
+│ Webflow Slug: widget-pro                                   │
+│ Last Synced: 2024-10-13 10:30:00 (5 minutes ago)          │
+│ Sync Count: 47                                              │
+│                                                             │
+│ ┌─────────────────────────────────────────────────────┐   │
+│ │ Current Webflow Data                                 │   │
+│ │ ┌───────────────────────────────────────────────┐  │   │
+│ │ │ {                                              │  │   │
+│ │ │   "name": "Widget Pro",                       │  │   │
+│ │ │   "slug": "widget-pro",                       │  │   │
+│ │ │   "sku": "WDG-001",                          │  │   │
+│ │ │   "price": 89.99,                            │  │   │
+│ │ │   "status": "sold",                          │  │   │
+│ │ │   "_archived": true                          │  │   │
+│ │ │ }                                              │  │   │
+│ │ └───────────────────────────────────────────────┘  │   │
+│ └─────────────────────────────────────────────────────┘   │
+│                                                             │
+│ [View in Webflow]  [Manual Resync]                        │
+│                                                             │
+│ ┌─────────────────────────────────────────────────────┐   │
+│ │ Sync History (Last 10)                               │   │
+│ │ ┌───────────────────────────────────────────────┐  │   │
+│ │ │ Date                Event          Status      │  │   │
+│ │ ├───────────────────────────────────────────────┤  │   │
+│ │ │ 2024-10-13 10:30   record_updated  ✓ Success │  │   │
+│ │ │ 2024-10-13 09:15   record_updated  ✓ Success │  │   │
+│ │ │ 2024-10-13 08:00   record_updated  ⚠️ Failed  │  │   │
+│ │ │ 2024-10-12 16:30   record_updated  ✓ Success │  │   │
+│ │ │ ...                                            │  │   │
+│ │ └───────────────────────────────────────────────┘  │   │
+│ │ [View All]                                           │   │
+│ └─────────────────────────────────────────────────────┘   │
+│                                                             │
+│ [Compare Syncs]                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Compare Syncs Modal**:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ Compare Syncs                                          [×] │
+├─────────────────────────────────────────────────────────────┤
+│ Select two syncs to compare:                               │
+│                                                             │
+│ Before: [2024-10-13 09:15                              ▼]  │
+│ After:  [2024-10-13 10:30                              ▼]  │
+│                                                             │
+│ [Compare]                                                   │
+│                                                             │
+│ ┌─────────────────────────────────────────────────────┐   │
+│ │ Field         Before           After                 │   │
+│ │ ├───────────────────────────────────────────────────┤  │
+│ │ │ name         Widget Pro       Widget Pro           │  │
+│ │ │ price        99.99            89.99        ⚠️      │  │
+│ │ │ status       active           sold          ⚠️      │  │
+│ │ │ _archived    false            true          ⚠️      │  │
+│ └─────────────────────────────────────────────────────┘   │
+│                                                             │
+│ 3 fields changed                                            │
+│                                                             │
+│                                               [Close]       │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Manual Resync**:
+- Fetches latest data from SmartSuite
+- Creates new event with current data
+- Processes immediately (bypasses queue)
+- Shows result (success/error)
+- Updates sync history
+
+---
+
+## 12) API Endpoints Specification
+
+### 12.1 Authentication
+
+**POST /api/auth/login**
+
+Request:
+```json
+{
+  "password": "admin_password"
+}
+```
+
+Response (200):
+```json
+{
+  "success": true,
+  "expiresAt": 1697200000
+}
+```
+
+Response (401):
+```json
+{
+  "error": "Invalid password"
+}
+```
+
+**POST /api/auth/logout**
+
+Response (200):
+```json
+{
+  "success": true
+}
+```
+
+### 12.2 Connections
+
+**GET /api/connections**
+
+Query params:
+- `status`: filter by status (optional)
+- `search`: search by name (optional)
+- `limit`: pagination limit (default 50)
+- `offset`: pagination offset (default 0)
+
+Response (200):
+```json
+{
+  "connections": [
+    {
+      "id": "conn_abc123",
+      "name": "Products Sync",
+      "status": "active",
+      "sourceType": "smartsuite",
+      "targetType": "webflow",
+      "lastSuccessAt": "2024-10-13T10:30:00Z",
+      "lastErrorAt": null,
+      "consecutiveErrors": 0,
+      "createdAt": "2024-10-01T00:00:00Z"
+    }
+  ],
+  "total": 5,
+  "limit": 50,
+  "offset": 0
+}
+```
+
+**GET /api/connections/[id]**
+
+Response (200):
+```json
+{
+  "id": "conn_abc123",
+  "name": "Products Sync",
+  "description": "Sync products from SmartSuite",
+  "status": "active",
+  "sourceType": "smartsuite",
+  "ssBaseId": "base_123",
+  "ssTableId": "table_456",
+  "targetType": "webflow",
+  "wfSiteId": "site_abc",
+  "wfCollectionId": "col_xyz",
+  "webhookUrl": "https://app.com/api/hooks/conn_abc123",
+  "rateLimitPerMin": 50,
+  "maxRetries": 5,
+  "retryBackoffMs": 1000,
+  "deleteOnRemove": false,
+  "lastSuccessAt": "2024-10-13T10:30:00Z",
+  "createdAt": "2024-10-01T00:00:00Z",
+  "mappings": [
+    {
+      "id": "map_123",
+      "fieldMap": {...},
+      "slugTemplate": "{{sku}}-{{kebab(name)}}",
+      "statusBehavior": {...}
+    }
+  ]
+}
+```
+
+Response (404):
+```json
+{
+  "error": "Connection not found"
+}
+```
+
+**POST /api/connections**
+
+Request:
+```json
+{
+  "name": "Products Sync",
+  "description": "Sync products from SmartSuite",
+  "sourceType": "smartsuite",
+  "ssBaseId": "base_123",
+  "ssTableId": "table_456",
+  "ssApiKey": "plaintext_api_key",
+  "targetType": "webflow",
+  "wfSiteId": "site_abc",
+  "wfCollectionId": "col_xyz",
+  "wfToken": "plaintext_token",
+  "rateLimitPerMin": 50,
+  "maxRetries": 5
+}
+```
+
+Response (201):
+```json
+{
+  "id": "conn_abc123",
+  "webhookUrl": "https://app.com/api/hooks/conn_abc123",
+  "webhookSecret": "wh_secret_xyz789"
+}
+```
+
+**PATCH /api/connections/[id]**
+
+Request:
+```json
+{
+  "name": "Products Sync Updated",
+  "status": "paused",
+  "rateLimitPerMin": 40
+}
+```
+
+Response (200):
+```json
+{
+  "id": "conn_abc123",
+  "name": "Products Sync Updated",
+  "status": "paused",
+  "updatedAt": "2024-10-13T10:35:00Z"
+}
+```
+
+**DELETE /api/connections/[id]**
+
+Soft deletes (archives) the connection.
+
+Response (204): No content
+
+### 12.3 Mappings
+
+**GET /api/mappings/[connectionId]**
+
+Response (200):
+```json
+{
+  "id": "map_123",
+  "connectionId": "conn_abc123",
+  "version": 1,
+  "fieldMap": {
+    "name": {
+      "type": "direct",
+      "source": "$.title"
+    },
+    "slug": {
+      "type": "template",
+      "template": "{{sku}}-{{kebab(title)}}"
+    },
+    "price": {
+      "type": "jsonata",
+      "expression": "$.price * 1.1"
+    }
+  },
+  "slugTemplate": "{{sku}}-{{kebab(title)}}",
+  "statusBehavior": {
+    "sold": {
+      "archive": true
+    }
+  },
+  "imageFieldMap": {
+    "primary": "$.images[0].url",
+    "gallery": "$.images[*].url"
+  },
+  "requiredFields": ["name", "slug"],
+  "isActive": true,
+  "createdAt": "2024-10-01T00:00:00Z",
+  "updatedAt": "2024-10-13T10:00:00Z"
+}
+```
+
+**POST /api/mappings/[connectionId]**
+
+Request:
+```json
+{
+  "fieldMap": {
+    "name": {
+      "type": "direct",
+      "source": "$.title"
+    }
+  },
+  "slugTemplate": "{{sku}}-{{kebab(title)}}",
+  "requiredFields": ["name", "slug"]
+}
+```
+
+Response (201):
+```json
+{
+  "id": "map_123",
+  "connectionId": "conn_abc123",
+  "createdAt": "2024-10-13T10:35:00Z"
+}
+```
+
+**PATCH /api/mappings/[id]**
+
+Request:
+```json
+{
+  "fieldMap": {
+    "price": {
+      "type": "jsonata",
+      "expression": "$.price * 0.9"
+    }
+  }
+}
+```
+
+Response (200):
+```json
+{
+  "id": "map_123",
+  "updatedAt": "2024-10-13T10:40:00Z"
+}
+```
+
+### 12.4 Events
+
+**GET /api/events**
+
+Query params:
+- `connectionId`: filter by connection (optional)
+- `status`: filter by status (optional)
+- `externalId`: search by external ID (optional)
+- `dateFrom`: ISO date (optional)
+- `dateTo`: ISO date (optional)
+- `limit`: pagination limit (default 50, max 100)
+- `offset`: pagination offset (default 0)
+
+Response (200):
+```json
+{
+  "events": [
+    {
+      "id": "evt_abc123",
+      "connectionId": "conn_xyz",
+      "externalSource": "smartsuite",
+      "externalId": "rec_product_123",
+      "status": "success",
+      "attempts": 1,
+      "queuedAt": "2024-10-13T10:30:00Z",
+      "processedAt": "2024-10-13T10:30:02Z",
+      "durationMs": 2100,
+      "wfItemId": "wf_item_abc",
+      "error": null,
+      "warnings": null
+    }
+  ],
+  "total": 1247,
+  "limit": 50,
+  "offset": 0
+}
+```
+
+**GET /api/events/[id]**
+
+Response (200):
+```json
+{
+  "id": "evt_abc123",
+  "connectionId": "conn_xyz",
+  "externalSource": "smartsuite",
+  "externalId": "rec_product_123",
+  "idempotencyKey": "idem_xyz",
+  "payload": {
+    "event_type": "record_updated",
+    "record_id": "rec_product_123",
+    "data": {...}
+  },
+  "payloadHash": "sha256_hash",
+  "status": "success",
+  "attempts": 1,
+  "retryAfter": null,
+  "error": null,
+  "errorStack": null,
+  "partialSuccess": false,
+  "warnings": null,
+  "queuedAt": "2024-10-13T10:30:00Z",
+  "processedAt": "2024-10-13T10:30:02Z",
+  "durationMs": 2100,
+  "wfItemId": "wf_item_abc",
+  "wfResponse": {...},
+  "createdAt": "2024-10-13T10:30:00Z"
+}
+```
+
+**POST /api/events/[id]/replay**
+
+Resets event to queued status for reprocessing.
+
+Response (200):
+```json
+{
+  "id": "evt_abc123",
+  "status": "queued",
+  "attempts": 0,
+  "retryAfter": null
+}
+```
+
+### 12.5 Items
+
+**GET /api/items/lookup**
+
+Query params:
+- `connectionId`: required
+- `externalId`: required
+
+Response (200):
+```json
+{
+  "connectionId": "conn_xyz",
+  "externalSource": "smartsuite",
+  "externalId": "rec_product_123",
+  "wfItemId": "wf_item_abc",
+  "wfSlug": "widget-pro",
+  "lastSyncedAt": "2024-10-13T10:30:00Z",
+  "syncCount": 47,
+  "webflowData": {
+    "name": "Widget Pro",
+    "slug": "widget-pro",
+    "price": 89.99,
+    ...
+  }
+}
+```
+
+Response (404):
+```json
+{
+  "error": "Item not found in IdMap"
+}
+```
+
+**POST /api/items/resync**
+
+Request:
+```json
+{
+  "connectionId": "conn_xyz",
+  "externalId": "rec_product_123"
+}
+```
+
+Response (200):
+```json
+{
+  "eventId": "evt_new_abc",
+  "status": "queued",
+  "message": "Manual resync triggered"
+}
+```
+
+### 12.6 Analytics
+
+**GET /api/analytics/daily**
+
+Query params:
+- `connectionId`: filter by connection (optional)
+- `dateFrom`: ISO date (required)
+- `dateTo`: ISO date (required)
+
+Response (200):
+```json
+{
+  "analytics": [
+    {
+      "date": "2024-10-13",
+      "connectionId": "conn_xyz",
+      "eventsTotal": 247,
+      "eventsSuccess": 245,
+      "eventsFailed": 2,
+      "eventsDeadLetter": 0,
+      "eventsSkipped": 0,
+      "p50LatencyMs": 1500,
+      "p95LatencyMs": 2300,
+      "p99LatencyMs": 3100,
+      "avgLatencyMs": 1800,
+      "topErrors": [
+        {
+          "error": "Field 'price' must be number",
+          "count": 2
+        }
+      ]
+    }
+  ]
+}
+```
+
+### 12.7 Discovery (SmartSuite & Webflow)
+
+**GET /api/discovery/smartsuite/bases**
+
+Query params:
+- `apiKey`: SmartSuite API key (required)
+
+Response (200):
+```json
+{
+  "bases": [
+    {
+      "id": "base_123",
+      "name": "Product Management"
+    }
+  ]
+}
+```
+
+**GET /api/discovery/smartsuite/tables**
+
+Query params:
+- `apiKey`: required
+- `baseId`: required
+
+Response (200):
+```json
+{
+  "tables": [
+    {
+      "id": "table_456",
+      "slug": "products",
+      "name": "Products"
+    }
+  ]
+}
+```
+
+**GET /api/discovery/smartsuite/fields**
+
+Query params:
+- `apiKey`: required
+- `baseId`: required
+- `tableId`: required
+
+Response (200):
+```json
+{
+  "fields": [
+    {
+      "slug": "title",
+      "label": "Product Name",
+      "field_type": "textfield",
+      "required": true
+    },
+    {
+      "slug": "price",
+      "label": "Price",
+      "field_type": "numberfield",
+      "required": false
+    }
+  ]
+}
+```
+
+**GET /api/discovery/webflow/sites**
+
+Query params:
+- `token`: Webflow PAT (required)
+
+Response (200):
+```json
+{
+  "sites": [
+    {
+      "id": "site_abc",
+      "displayName": "My Store",
+      "shortName": "my-store"
+    }
+  ]
+}
+```
+
+**GET /api/discovery/webflow/collections**
+
+Query params:
+- `token`: required
+- `siteId`: required
+
+Response (200):
+```json
+{
+  "collections": [
+    {
+      "id": "col_xyz",
+      "displayName": "Products",
+      "slug": "products"
+    }
+  ]
+}
+```
+
+**GET /api/discovery/webflow/fields**
+
+Query params:
+- `token`: required
+- `collectionId`: required
+
+Response (200):
+```json
+{
+  "fields": [
+    {
+      "id": "field_123",
+      "slug": "name",
+      "displayName": "Name",
+      "type": "PlainText",
+      "isRequired": true
+    },
+    {
+      "id": "field_456",
+      "slug": "price",
+      "displayName": "Price",
+      "type": "Number",
+      "isRequired": false
+    }
+  ]
+}
+```
+
+### 12.8 Webhook Ingress
+
+**POST /api/hooks/[connectionId]**
+
+Headers:
+- `x-smartsuite-signature`: HMAC-SHA256 signature
+- `x-smartsuite-timestamp`: Unix timestamp
+- `x-idempotency-key`: Optional idempotency key
+
+Request:
+```json
+{
+  "event_type": "record_updated",
+  "solution_id": "base_123",
+  "application_id": "table_456",
+  "record_id": "rec_product_123",
+  "timestamp": "2024-10-13T10:30:00Z",
+  "data": {
+    "title": "Widget Pro",
+    "price": 99.99,
+    ...
+  }
+}
+```
+
+Response (202):
+```json
+{
+  "eventId": "evt_abc123",
+  "status": "queued"
+}
+```
+
+Response (401):
+```json
+{
+  "error": "Invalid signature"
+}
+```
+
+Response (409):
+```json
+{
+  "error": "Duplicate event",
+  "eventId": "evt_existing_123"
+}
+```
+
+### 12.9 Worker (Cron)
+
+**POST /api/jobs/ingest**
+
+Headers:
+- `Authorization`: Bearer {CRON_SECRET}
+
+Response (200):
+```json
+{
+  "processed": 25,
+  "succeeded": 23,
+  "failed": 2,
+  "durationMs": 4500,
+  "queueDepth": 75,
+  "oldestEventAge": 120
+}
+```
+
+Response (423):
+```json
+{
+  "error": "Worker already running"
+}
+```
+
+---
+
+## 13) Error Handling Strategy
+
+### 13.1 Error Categories
+
+**Network Errors** (retriable):
+- ECONNREFUSED
+- ETIMEDOUT
+- ENOTFOUND
+- Socket hang up
+- Network unreachable
+
+**HTTP 4xx Errors**:
+- 400: Bad request (non-retriable - fix mapping)
+- 401: Unauthorized (non-retriable - invalid token)
+- 403: Forbidden (non-retriable - missing permission)
+- 404: Not found (non-retriable - collection/item deleted)
+- 408: Request timeout (retriable)
+- 409: Conflict (non-retriable - e.g., slug collision after retries)
+- 422: Validation error (non-retriable - fix data)
+- 429: Rate limit (retriable with backoff)
+
+**HTTP 5xx Errors** (retriable):
+- 500: Internal server error
+- 502: Bad gateway
+- 503: Service unavailable
+- 504: Gateway timeout
+
+**Application Errors**:
+- Mapping errors (non-retriable - fix configuration)
+- Validation errors (non-retriable - fix data)
+- Missing required field (non-retriable - fix mapping)
+- Type mismatch (non-retriable - fix mapping)
+
+### 13.2 Error Response Format
+
+**Standard Error Response**:
+```typescript
+{
+  error: string;          // Human-readable message
+  code?: string;          // Machine-readable code
+  details?: any;          // Additional context
+  retriable?: boolean;    // Can this be retried?
+}
+```
+
+**Examples**:
+
+```json
+// Validation error
+{
+  "error": "Validation failed",
+  "code": "VALIDATION_ERROR",
+  "details": {
+    "field": "price",
+    "message": "Must be a number",
+    "received": "\"99.99\""
+  },
+  "retriable": false
+}
+
+// Rate limit error
+{
+  "error": "Rate limit exceeded",
+  "code": "RATE_LIMIT_EXCEEDED",
+  "details": {
+    "retryAfter": 30
+  },
+  "retriable": true
+}
+
+// Network error
+{
+  "error": "Connection timeout",
+  "code": "NETWORK_TIMEOUT",
+  "details": {
+    "url": "https://api.webflow.com/...",
+    "timeout": 30000
+  },
+  "retriable": true
+}
+```
+
+### 13.3 Error Logging
+
+**Log Levels**:
+- `error`: System errors, failed events (dead letter)
+- `warn`: Retriable failures, partial success, config issues
+- `info`: Normal operations (events processed, syncs completed)
+- `debug`: Detailed flow (for development)
+
+**Structured Logging Format**:
+```typescript
+{
+  level: 'error',
+  msg: 'Event processing failed',
+  timestamp: '2024-10-13T10:30:00Z',
+  context: {
+    eventId: 'evt_abc123',
+    connectionId: 'conn_xyz',
+    externalId: 'rec_product_123',
+    attempt: 3,
+    error: 'Field validation failed',
+    stack: '...'
+  }
+}
+```
+
+**Redaction**:
+- Never log API keys, tokens, or secrets
+- Redact sensitive fields in payloads
+- Example: `{ apiKey: '***', price: 99.99 }`
+
+### 13.4 User-Facing Error Messages
+
+**Dashboard Error Display**:
+- Show clear, actionable error messages
+- Link to relevant documentation
+- Suggest fixes when possible
+
+**Examples**:
+
+**Mapping Error**:
+```
+⚠️ Mapping Error
+
+Field 'price' expects a number but received text.
+
+How to fix:
+1. Go to Edit Mapping
+2. Change 'price' field to use JSONata: $number($.price)
+3. Test your mapping
+4. Save changes
+
+[Edit Mapping]  [View Documentation]
+```
+
+**Authentication Error**:
+```
+🔴 Authentication Failed
+
+Your Webflow token has expired or been revoked.
+
+How to fix:
+1. Generate a new Personal Access Token in Webflow
+2. Go to Connection Settings
+3. Update the token
+4. Test the connection
+
+[Update Token]  [Webflow API Docs]
+```
+
+**Rate Limit Error**:
+```
+⏱️ Rate Limit Reached
+
+Processing paused temporarily due to Webflow API rate limits.
+Events will resume automatically.
+
+Current status:
+- 47 events queued
+- Will resume at: 10:32 AM
+- Next batch: 25 events
+
+[View Queue]
+```
+
+### 13.5 Error Recovery Strategies
+
+**Automatic Recovery**:
+- Exponential backoff for retriable errors
+- Queue rate limiting prevents overwhelming APIs
+- Health checks detect connection issues
+- Automatic pause after 10 consecutive failures
+
+**Manual Recovery**:
+- Admin reviews dead letter queue
+- Fixes mapping or configuration
+- Replays failed events
+- Monitors success rate
+
+**Graceful Degradation**:
+- Partial success (some fields fail, item still created)
+- Image validation failures don't block item creation
+- Warning logs for non-critical issues
+
+---
+
+## 14) Logging & Monitoring
+
+### 14.1 Logging Implementation
+
+**Use Pino** for structured JSON logging
+
+**Configuration**:
+```typescript
+// Production
+{
+  level: 'info',
+  formatters: {
+    level: (label) => ({ level: label })
+  },
+  timestamp: () => `,"time":"${new Date().toISOString()}"`
+}
+
+// Development
+{
+  level: 'debug',
+  transport: {
+    target: 'pino-pretty',
+    options: {
+      colorize: true,
+      translateTime: 'SYS:standard',
+      ignore: 'pid,hostname'
+    }
+  }
+}
+```
+
+**Log Context**:
+Every log should include relevant context:
+```typescript
+logger.info({
+  connectionId: 'conn_abc',
+  eventId: 'evt_xyz',
+  externalId: 'rec_123',
+  action: 'event_processed',
+  duration: 2100
+}, 'Event processed successfully');
+```
+
+**Log Locations**:
+- Webhook ingress: connection ID, external ID, signature valid
+- Worker: batch size, duration, success/fail counts
+- Event processor: event ID, attempt number, result
+- Webflow client: API calls, rate limit info, responses
+- Mapper: transformation steps, validation results
+
+### 14.2 Metrics to Track
+
+**Volume Metrics**:
+- Events received (per connection, per hour)
+- Events processed (per connection, per hour)
+- Success rate (percentage)
+- Failure rate (percentage)
+- Dead letter count
+
+**Performance Metrics**:
+- Event processing latency (p50, p95, p99)
+- API call latency (SmartSuite, Webflow)
+- Queue depth (events waiting)
+- Worker duration (time to process batch)
+
+**Health Metrics**:
+- Connection health (last success, consecutive errors)
+- Queue age (oldest queued event)
+- Worker runs (frequency, duration)
+- Rate limit hits
+
+### 14.3 Alerting Rules
+
+**Critical Alerts** (immediate action):
+- Worker hasn't run in >5 minutes
+- Connection status = error for >1 hour
+- Queue depth >500
+- Success rate <50% for >15 minutes
+
+**Warning Alerts** (investigate soon):
+- Queue depth >100 for >10 minutes
+- Success rate <90% for >1 hour
+- High rate limit hits (>10/hour)
+- Dead letter events >50
+
+**Info Alerts** (FYI):
+- New connection created
+- Connection paused/resumed
+- Mapping updated
+- Credentials rotated
+
+### 14.4 Dashboard Monitoring
+
+**Overview Page Metrics**:
+- Last 24h: total, success, failed, success %
+- Last 7d: line chart of events per day
+- Active connections with health status
+- Top errors
+
+**Connection Detail Metrics**:
+- Recent events (last 10)
+- Success rate chart (7d)
+- P95 latency chart (7d)
+- Error log (last 20)
+
+**Events Inbox**:
+- Filter by status
+- Search by ID
+- View error details
+- Retry failed events
+
+**Health Check Endpoint** (`/api/health`):
+```json
+{
+  "status": "healthy",
+  "timestamp": "2024-10-13T10:30:00Z",
+  "checks": {
+    "database": "connected",
+    "queueDepth": 42,
+    "oldestEventAge": 120,
+    "workerLastRun": "2024-10-13T10:29:00Z",
+    "connections": {
+      "total": 5,
+      "active": 4,
+      "error": 1
+    }
+  }
+}
+```
+
+### 14.5 External Monitoring (Optional)
+
+**Sentry** (error tracking):
+- Capture exceptions
+- Tag with context (connectionId, eventId)
+- Alert on new error types
+- Track error frequency
+
+**BetterStack** (logging):
+- Ship structured logs
+- Create dashboards
+- Set up alerts
+- Search and filter logs
+
+**Vercel Analytics**:
+- Track API endpoint performance
+- Monitor cron job executions
+- Track deployment health
+
+---
+
+## 15) Testing Requirements
+
+### 15.1 Unit Tests
+
+**Coverage Areas**:
+- Crypto functions (encrypt/decrypt)
+- Webhook signature verification
+- Mapping engine (all transform types)
+- Field type compatibility
+- Slug generation
+- IdMap lookup
+- Error classification (retriable vs non-retriable)
+
+**Test Files**:
+```
+/tests/unit/
+  crypto.test.ts
+  webhook-security.test.ts
+  mapper.test.ts
+  field-types.test.ts
+  validator.test.ts
+```
+
+**Example Test**:
+```typescript
+describe('Mapper', () => {
+  it('should apply direct mapping', () => {
+    const config = {
+      type: 'direct',
+      source: '$.title'
+    };
+    const data = { title: 'Widget Pro' };
+    
+    const result = applyFieldMapping(config, data);
+    
+    expect(result).toBe('Widget Pro');
+  });
+  
+  it('should apply JSONata expression', () => {
+    const config = {
+      type: 'jsonata',
+      expression: '$.price * 0.9'
+    };
+    const data = { price: 100 };
+    
+    const result = applyFieldMapping(config, data);
+    
+    expect(result).toBe(90);
+  });
+});
+```
+
+### 15.2 Integration Tests
+
+**Coverage Areas**:
+- Webhook ingress → event creation
+- Event processing → Webflow upsert
+- IdMap creation and lookup
+- Connection CRUD operations
+- Mapping CRUD operations
+- Discovery API calls
+
+**Test Files**:
+```
+/tests/integration/
+  webhook-ingress.test.ts
+  event-processor.test.ts
+  connections.test.ts
+  discovery.test.ts
+```
+
+**Mock External APIs**:
+- Use `msw` (Mock Service Worker) or similar
+- Mock SmartSuite API responses
+- Mock Webflow API responses
+- Test retry logic with transient failures
+
+### 15.3 End-to-End Tests
+
+**Critical Flows**:
+1. Create connection → configure mapping → receive webhook → sync to Webflow
+2. Failed event → retry → success
+3. Dead letter event → fix mapping → replay → success
+4. Rate limit hit → backoff → retry → success
+
+**Test Environment**:
+- Use test database
+- Use test SmartSuite workspace
+- Use test Webflow site
+- Real API calls (or very realistic mocks)
+
+### 15.4 Manual Testing Checklist
+
+**Before Deployment**:
+- [ ] Create new connection (full wizard flow)
+- [ ] Test webhook with real SmartSuite data
+- [ ] Verify event appears in inbox
+- [ ] Verify item created in Webflow
+- [ ] Update SmartSuite record, verify update in Webflow
+- [ ] Test failed event (invalid field), verify dead letter
+- [ ] Fix mapping, replay event, verify success
+- [ ] Test all dashboard pages render correctly
+- [ ] Test logout and login
+- [ ] Test CSRF protection
+- [ ] Test rate limiting (send many webhooks quickly)
+
+---
+
+## 16) Deployment Instructions
+
+### 16.1 Prerequisites
+
+**Accounts & Services**:
+- Vercel account (for hosting)
+- Neon account (for PostgreSQL)
+- SmartSuite account (for testing)
+- Webflow account with site (for testing)
+- Domain name (optional, but recommended)
+
+**Generate Secrets**:
+```bash
+# SESSION_PASSWORD (32+ chars)
+openssl rand -base64 32
+
+# DATA_ENCRYPTION_KEY (64 hex chars)
+openssl rand -hex 32
+
+# CRON_SECRET
+openssl rand -base64 32
+
+# DASHBOARD_PASSWORD_HASH
+node -e "console.log(require('bcryptjs').hashSync('YourPasswordHere', 10))"
+```
+
+### 16.2 Database Setup
+
+**Create Neon Project**:
+1. Go to https://neon.tech
+2. Create new project
+3. Copy connection string (pooled)
+4. Copy direct URL (for migrations)
+
+**Run Migrations**:
+```bash
+# Set DATABASE_URL in .env.local
+DATABASE_URL=postgresql://...?pgbouncer=true
+DIRECT_DATABASE_URL=postgresql://...
+
+# Generate Prisma Client
+npx prisma generate
+
+# Push schema to database
+npx prisma db push
+
+# Or run migration
+npx prisma migrate deploy
+```
+
+### 16.3 Vercel Deployment
+
+**Initial Setup**:
+```bash
+# Install Vercel CLI
+npm i -g vercel
+
+# Login
+vercel login
+
+# Link project
+vercel link
+
+# Set environment variables
+vercel env add SESSION_PASSWORD production
+vercel env add DATA_ENCRYPTION_KEY production
+vercel env add DASHBOARD_PASSWORD_HASH production
+vercel env add DATABASE_URL production
+vercel env add DIRECT_DATABASE_URL production
+vercel env add CRON_SECRET production
+# ... add all other env vars
+```
+
+**Deploy**:
+```bash
+# Deploy to production
+vercel --prod
+
+# Check deployment
+vercel ls
+```
+
+**Configure Cron**:
+Add to `vercel.json`:
+```json
+{
+  "crons": [
+    {
+      "path": "/api/jobs/ingest",
+      "schedule": "* * * * *"
+    }
+  ]
+}
+```
+
+### 16.4 Post-Deployment Verification
+
+**Health Check**:
+```bash
+curl https://your-app.vercel.app/api/health
+```
+
+**Test Endpoints**:
+```bash
+# Login (should return 401 without password)
+curl https://your-app.vercel.app/api/auth/login
+
+# Connections (should redirect to login)
+curl https://your-app.vercel.app/api/connections
+```
+
+**Monitor Logs**:
+```bash
+# Stream logs
+vercel logs --follow
+
+# Or use Vercel dashboard
+```
+
+### 16.5 Domain Configuration (Optional)
+
+**Add Custom Domain**:
+1. Go to Vercel project settings
+2. Add domain (e.g., sync.yourdomain.com)
+3. Configure DNS (CNAME or A record)
+4. Wait for SSL certificate provisioning
+
+**Update Environment**:
+```bash
+# Update APP_URL
+vercel env add APP_URL production
+# Set to: https://sync.yourdomain.com
+```
+
+---
+
+## 17) Implementation Checklist
+
+### 17.1 Phase 1: Foundation (Week 1)
+
+**Day 1-2: Project Setup**
+- [ ] Initialize Next.js project with TypeScript
+- [ ] Install all dependencies from package.json
+- [ ] Configure Tailwind CSS
+- [ ] Set up ESLint and Prettier
+- [ ] Create initial folder structure
+- [ ] Set up Git repository
+- [ ] Configure environment variables
+
+**Day 3-4: Database & Security**
+- [ ] Create Prisma schema (all models)
+- [ ] Run initial migration
+- [ ] Implement crypto.ts (encrypt/decrypt)
+- [ ] Implement webhook-security.ts (signature, timestamp)
+- [ ] Implement session.ts (iron-session setup)
+- [ ] Implement env.ts (Zod validation)
+- [ ] Create logger.ts (Pino configuration)
+
+**Day 5-7: External API Clients**
+- [ ] Implement webflow.ts (all discovery methods)
+- [ ] Implement smartsuite.ts (all discovery methods)
+- [ ] Add retry logic (p-retry)
+- [ ] Add rate limiting (p-queue)
+- [ ] Test API clients with real credentials
+- [ ] Handle errors gracefully
+
+### 17.2 Phase 2: Core Sync Engine (Week 2)
+
+**Day 1-2: Webhook Ingress**
+- [ ] Implement POST /api/hooks/[connectionId]
+- [ ] Verify signatures
+- [ ] Check idempotency
+- [ ] Insert events
+- [ ] Return 202 Accepted
+- [ ] Test with mock SmartSuite webhooks
+
+**Day 3-4: Mapping Engine**
+- [ ] Implement normalizeSmartSuitePayload
+- [ ] Implement applyFieldMapping (all types)
+- [ ] Implement buildWebflowBody
+- [ ] Add transform functions
+- [ ] Test with sample data
+
+**Day 5-6: Event Processor**
+- [ ] Implement EventProcessor class
+- [ ] Handle success/failure states
+- [ ] Implement retry logic
+- [ ] Update IdMap
+- [ ] Test full event lifecycle
+
+**Day 7: Worker**
+- [ ] Implement POST /api/jobs/ingest
+- [ ] Add distributed lock
+- [ ] Process events in batch
+- [ ] Test worker execution
+
+### 17.3 Phase 3: Dashboard UI (Week 3)
+
+**Day 1: Authentication**
+- [ ] Implement /admin/login page
+- [ ] Implement auth middleware
+- [ ] Implement CSRF protection
+- [ ] Test login flow
+
+**Day 2-3: Overview Dashboard**
+- [ ] Implement /admin page layout
+- [ ] Add metrics cards
+- [ ] Add charts (Recharts)
+- [ ] Add connections table
+- [ ] Add recent errors
+
+**Day 4-5: Connections**
+- [ ] Implement /admin/connections list
+- [ ] Implement /admin/connections/[id] detail
+- [ ] Add actions (pause, resume, delete)
+- [ ] Test CRUD operations
+
+**Day 6-7: Events Inbox**
+- [ ] Implement /admin/events table
+- [ ] Add filters and search
+- [ ] Implement event detail modal
+- [ ] Add replay functionality
+
+### 17.4 Phase 4: Mapping Wizard (Week 4)
+
+**Day 1-2: Steps 1-3**
+- [ ] Implement credentials step
+- [ ] Implement source selection
+- [ ] Implement target selection
+- [ ] Add discovery API calls
+- [ ] Test with real APIs
+
+**Day 3-4: Steps 4-5**
+- [ ] Implement field mapping step
+- [ ] Add auto-map algorithm
+- [ ] Implement advanced config modals
+- [ ] Implement transforms step
+
+**Day 5-6: Steps 6-7**
+- [ ] Implement test mapping step
+- [ ] Add preview functionality
+- [ ] Implement webhook setup step
+- [ ] Generate webhook secrets
+- [ ] Test full wizard flow
+
+**Day 7: Item Inspector**
+- [ ] Implement /admin/items page
+- [ ] Add lookup by ID
+- [ ] Show sync history
+- [ ] Add diff viewer
+- [ ] Add manual resync
+
+### 17.5 Phase 5: Polish & Testing (Week 5)
+
+**Day 1-2: Error Handling**
+- [ ] Improve error messages
+- [ ] Add error recovery flows
+- [ ] Test all error scenarios
+- [ ] Add user-facing help text
+
+**Day 3-4: Testing**
+- [ ] Write unit tests
+- [ ] Write integration tests
+- [ ] End-to-end testing
+- [ ] Performance testing
+- [ ] Security testing
+
+**Day 5-6: Documentation**
+- [ ] Write README
+- [ ] Document API endpoints
+- [ ] Create user guide
+- [ ] Add inline code comments
+- [ ] Create troubleshooting guide
+
+**Day 7: Deployment**
+- [ ] Deploy to Vercel
+- [ ] Configure cron
+- [ ] Test production deployment
+- [ ] Monitor logs
+- [ ] Verify all features work
+
+---
+
+## 18) Edge Cases & Special Scenarios
+
+### 18.1 Slug Collisions
+
+**Problem**: Generated slug already exists in Webflow collection
+
+**Solution**:
+1. Attempt to create item with slug
+2. If 409 Conflict returned:
+   - Append `-1` to slug
+   - Retry with new slug
+3. If still 409:
+   - Increment counter: `-2`, `-3`, etc.
+   - Max 10 attempts
+4. If still failing:
+   - Mark event as failed
+   - Log error with details
+   - Admin must manually resolve
+
+**Implementation Note**:
+- Cache recently used slugs to avoid unnecessary API calls
+- Log all slug collision events for analysis
+- Consider adding unique identifier to slug template by default
+
+### 18.2 Deleted Collections/Items
+
+**Scenario**: Webflow collection or item deleted after IdMap created
+
+**Detection**:
+- Webflow API returns 404 on UPDATE
+- Or returns error "Collection not found"
+
+**Handling**:
+1. Log warning with context
+2. Mark connection status as 'error'
+3. Set connection.lastErrorMessage
+4. Pause further processing for this connection
+5. Alert admin via dashboard
+6. Admin must either:
+   - Update connection to point to new collection
+   - Delete/archive connection
+
+**Prevention**:
+- Add health check that validates collection exists
+- Run periodically (daily)
+- Alert before processing new events
+
+### 18.3 Circular References
+
+**Scenario**: SmartSuite has circular linked records (A → B → A)
+
+**Prevention**:
+- Detect circular references during reference resolution
+- Track visited record IDs in resolution path
+- If record already in path: break cycle, log warning
+
+**Fallback**:
+- Skip reference field
+- Log warning with details
+- Mark as partial success
+- Item still created with other fields
+
+### 18.4 Large Payloads
+
+**Scenario**: SmartSuite webhook payload exceeds size limit
+
+**Limits**:
+- Vercel: 4.5MB request body limit
+- PostgreSQL JSON column: practical limit ~1GB (but slow)
+
+**Handling**:
+1. Check payload size on ingress
+2. If >4MB: reject with 413 Payload Too Large
+3. Suggest: reduce fields sent in webhook
+4. Alternative: fetch full record on-demand
+
+**Implementation**:
+```typescript
+if (req.headers['content-length'] > 4_500_000) {
+  return new Response('Payload too large', { status: 413 });
+}
+```
+
+### 18.5 Timezone Handling
+
+**Scenario**: Date fields have timezone differences
+
+**Solution**:
+- Always store dates in UTC (ISO 8601 format)
+- SmartSuite sends dates in UTC
+- Webflow expects dates in ISO 8601
+- Use date-fns-tz for any timezone conversions
+- Let Webflow handle display timezone
+
+**Mapping Example**:
+```json
+{
+  "published_date": {
+    "type": "jsonata",
+    "expression": "$toMillis($.published_on)"
+  }
+}
+```
+
+### 18.6 Rate Limit Exhaustion
+
+**Scenario**: All retry attempts exhausted due to sustained rate limiting
+
+**Detection**:
+- Multiple 429 errors in succession
+- Retry backoff reaches max (60s)
+- Still getting rate limited
+
+**Handling**:
+1. Pause connection processing for 5 minutes
+2. Log incident with details
+3. Alert admin
+4. After pause, resume at lower rate
+5. Suggest: reduce rateLimitPerMin setting
+
+**Adaptive Rate Limiting** (future enhancement):
+- Parse X-RateLimit-Remaining header
+- Dynamically adjust queue interval
+- If remaining <10: slow down
+- If remaining >50: speed up
+
+### 18.7 Partial Success with Images
+
+**Scenario**: 5 images in payload, 2 fail validation, 3 succeed
+
+**Handling**:
+1. Process all valid images
+2. Create/update item with valid images
+3. Mark event as `partialSuccess=true`
+4. Add warnings array:
+```json
+{
+  "partialSuccess": true,
+  "warnings": [
+    "Image 2 failed: 404 Not Found",
+    "Image 4 failed: Invalid content-type"
+  ]
+}
+```
+
+**Dashboard Display**:
+- Show warning icon on event
+- List warnings in detail view
+- Item still created (not failed)
+
+### 18.8 Schema Changes
+
+**Scenario**: SmartSuite or Webflow collection schema changes
+
+**Detection**:
+- Field no longer exists
+- Field type changed
+- API returns validation error
+
+**Handling**:
+1. Catch validation errors
+2. Check if field exists in current schema
+3. If not: log error with details
+4. Suggest: update mapping
+5. Continue with other fields (partial success)
+
+**Prevention**:
+- Schema version tracking in mapping
+- Periodic schema validation
+- Alert on schema drift
+
+### 18.9 Multi-Locale Support
+
+**Scenario**: Webflow site uses localization
+
+**Current Scope**: Single locale (primary)
+
+**Future Enhancement**:
+- Store `cmsLocaleId` in IdMap
+- Create separate events per locale
+- Mapping wizard includes locale selection
+- UI to manage locale-specific mappings
+
+**Implementation Note**:
+- For v1: use primary locale only
+- Document limitation
+- Design schema to support multi-locale later
+
+### 18.10 Backfill Historical Data
+
+**Scenario**: User wants to sync existing SmartSuite records (not just new webhooks)
+
+**Implementation**:
+1. Add "Backfill" button to connection detail
+2. Fetch records from SmartSuite (paginated)
+3. Filter by `updated_on > connection.lastBackfillAt`
+4. Create event for each record
+5. Process via normal worker
+6. Update `connection.lastBackfillAt`
+
+**UI Flow**:
+```
+┌─────────────────────────────────────────────┐
+│ Backfill Data                          [×] │
+├─────────────────────────────────────────────┤
+│                                             │
+│ Fetch records updated since:                │
+│ [2024-01-01                            ▼]  │
+│                                             │
+│ Batch size: [100                        ]  │
+│                                             │
+│ This will create events for existing       │
+│ records. Processing may take several       │
+│ minutes depending on record count.         │
+│                                             │
+│ [Cancel]                   [Start Backfill]│
+└─────────────────────────────────────────────┘
+```
+
+**Progress**:
+- Show progress bar
+- Estimate time remaining
+- Allow cancellation
+- Resume from last fetched record
+
+---
+
+## END OF SPECIFICATION
+
+This specification is comprehensive and production-ready. It covers:
+
+✅ Complete architecture with data flow diagrams  
+✅ Full technology stack with rationale  
+✅ Detailed database schema with all relationships  
+✅ External API integration specifics  
+✅ Security implementation (encryption, webhooks, auth)  
+✅ Core business logic (event lifecycle, mapping, upsert)  
+✅ Queue and worker system with distributed locking  
+✅ Comprehensive mapping engine with all transform types  
+✅ Complete dashboard UI specifications with mockups  
+✅ All API endpoints with request/response examples  
+✅ Error handling strategy with retry logic  
+✅ Logging and monitoring requirements  
+✅ Testing strategy and requirements  
+✅ Deployment instructions step-by-step  
+✅ Implementation checklist with timeline  
+✅ Edge cases and special scenarios  
+
+**Total Estimated Time**: 5 weeks for one developer
+
+**Next Steps**:
+1. Review and approve this specification
+2. Set up development environment
+3. Follow implementation checklist
+4. Build incrementally, testing each phase
+5. Deploy to staging for user testing
+6. Deploy to production
+
+**Questions or Clarifications**:
+This spec should provide everything Claude Code needs to build this system. If anything is unclear or needs more detail, please ask!

@@ -1,0 +1,262 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_DATABASE_URL")
+}
+
+// ============================================================================
+// ENUMS
+// ============================================================================
+
+enum EventStatus {
+  queued
+  processing
+  success
+  failed
+  dead_letter
+  skipped
+}
+
+enum SourceType {
+  smartsuite
+}
+
+enum TargetType {
+  webflow
+}
+
+enum ConnectionStatus {
+  active
+  paused
+  error
+  archived
+}
+
+enum FieldMappingType {
+  direct
+  jsonata
+  template
+  constant
+  reference
+}
+
+// ============================================================================
+// MODELS
+// ============================================================================
+
+model Connection {
+  id          String           @id @default(cuid())
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+  name        String
+  description String?
+  status      ConnectionStatus @default(paused)
+
+  // Source: SmartSuite
+  sourceType SourceType
+  ssBaseId   String // SmartSuite Base ID
+  ssTableId  String // SmartSuite Table/App ID
+
+  // Encrypted SmartSuite API Key
+  ssApiKeyEnc String // ciphertext (base64)
+  ssApiKeyIv  String // IV (base64)
+
+  // Target: Webflow
+  targetType       TargetType
+  wfSiteId         String // Webflow Site ID
+  wfCollectionId   String // Webflow Collection ID
+  wfPublishOnSync  Boolean    @default(false)
+  wfDefaultLocale  String?
+  wfDefaultTimezone String?
+
+  // Encrypted Webflow Token
+  wfTokenEnc String // ciphertext (base64)
+  wfTokenIv  String // IV (base64)
+
+  // Webhook Configuration
+  webhookSecretHash String  @unique // bcrypt hash of the webhook secret
+  webhookUrl        String? // Full webhook URL (for reference)
+
+  // Rate Limiting & Retry
+  rateLimitPerMin Int @default(50)
+  maxRetries      Int @default(5)
+  retryBackoffMs  Int @default(1000)
+
+  // Health Tracking
+  lastSuccessAt      DateTime?
+  lastErrorAt        DateTime?
+  lastErrorMessage   String?
+  consecutiveErrors  Int       @default(0)
+
+  // Relationships
+  mappings       Mapping[]
+  events         Event[]
+  idMaps         IdMap[]
+  analyticsDaily AnalyticsDaily[]
+  auditLogs      AuditLog[]
+
+  @@index([status])
+  @@index([sourceType, ssBaseId, ssTableId])
+  @@index([targetType, wfSiteId, wfCollectionId])
+}
+
+model Mapping {
+  id        String   @id @default(cuid())
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  connectionId String
+  connection   Connection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+
+  // Field Mapping Configuration (JSON)
+  fieldMap Json // { "wfFieldSlug": { type, source, transform, default } }
+
+  // Slug Generation
+  slugTemplate String? // Template for generating Webflow slug
+
+  // Status Behavior
+  statusBehavior Json? // { "archived": "skip", "deleted": "delete_in_webflow" }
+
+  // Image/File Handling
+  imageFieldMap Json? // { "ssImageField": "wfImageField" }
+
+  // Reference Field Handling
+  referenceMap Json? // { "ssRefField": { targetConnection, wfRefField } }
+
+  // Required Fields
+  requiredFields String[] // List of required Webflow field slugs
+
+  // Active flag (only one active mapping per connection)
+  isActive Boolean @default(true)
+
+  @@index([connectionId])
+  @@index([connectionId, isActive])
+}
+
+model IdMap {
+  id        String   @id @default(cuid())
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  connectionId String
+  connection   Connection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+
+  // External Source (SmartSuite)
+  externalSource String // "smartsuite"
+  externalId     String // SmartSuite record ID
+
+  // Webflow Target
+  wfItemId String // Webflow item ID
+
+  // Metadata
+  lastSyncedAt DateTime @default(now())
+
+  @@unique([connectionId, externalSource, externalId])
+  @@index([connectionId])
+  @@index([wfItemId])
+}
+
+model Event {
+  id        String   @id @default(cuid())
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  connectionId String
+  connection   Connection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+
+  // Event Identification
+  externalSource String // "smartsuite"
+  externalId     String // SmartSuite record ID
+
+  // Idempotency
+  idempotencyKey String  @unique
+  payloadHash    String // SHA-256 of the raw payload
+
+  // Status & Processing
+  status      EventStatus @default(queued)
+  queuedAt    DateTime    @default(now())
+  processedAt DateTime?
+  attempts    Int         @default(0)
+  retryAfter  DateTime?
+
+  // Payload
+  payload Json // Full webhook payload
+
+  // Error Tracking
+  error      String? // Error message
+  errorStack String? // Stack trace
+
+  // Result
+  wfItemId       String?  // Webflow item ID (if successful)
+  wfResponse     Json? // Full Webflow API response
+  warnings       String[] // Non-fatal warnings
+  partialSuccess Boolean  @default(false)
+
+  // Timing
+  webhookTimestamp DateTime? // Timestamp from webhook header
+  durationMs       Int? // Processing duration in milliseconds
+
+  @@index([connectionId])
+  @@index([status])
+  @@index([queuedAt])
+  @@index([retryAfter])
+  @@index([externalSource, externalId])
+}
+
+model AnalyticsDaily {
+  id   String   @id @default(cuid())
+  date DateTime @db.Date
+
+  connectionId String?
+  connection   Connection? @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+
+  // Metrics
+  eventsReceived   Int @default(0)
+  eventsProcessed  Int @default(0)
+  eventsSucceeded  Int @default(0)
+  eventsFailed     Int @default(0)
+  eventsSkipped    Int @default(0)
+  itemsCreated     Int @default(0)
+  itemsUpdated     Int @default(0)
+  itemsDeleted     Int @default(0)
+  avgDurationMs    Int @default(0)
+  p95DurationMs    Int @default(0)
+  p99DurationMs    Int @default(0)
+
+  @@unique([date, connectionId])
+  @@index([date])
+  @@index([connectionId])
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  createdAt DateTime @default(now())
+
+  connectionId String?
+  connection   Connection? @relation(fields: [connectionId], references: [id], onDelete: SetNull)
+
+  action String // e.g., "connection.created", "event.processed", "worker.completed"
+  actor  String? // User ID or "system"
+
+  metadata Json? // Additional context
+
+  @@index([connectionId])
+  @@index([action])
+  @@index([createdAt])
+}
+
+model DistributedLock {
+  id         String   @id // Lock ID (e.g., "worker:ingest")
+  acquiredBy String // Process ID
+  acquiredAt DateTime @default(now())
+  expiresAt  DateTime
+
+  @@index([expiresAt])
+}
