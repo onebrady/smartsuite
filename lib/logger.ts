@@ -3,7 +3,7 @@ import { env } from './env';
 
 // Create logger with appropriate configuration based on environment
 export const logger = pino({
-  level: env.LOG_LEVEL,
+  level: env.LOG_LEVEL || 'info',
   formatters: {
     level: (label) => {
       return { level: label };
