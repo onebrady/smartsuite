@@ -137,7 +137,7 @@ npx prisma studio
 
 3. Check cron job:
    - Go to Vercel project → Deployments → Functions → Cron Jobs
-   - Should see `/api/jobs/ingest` running every minute
+   - Should see `/api/jobs/ingest` running every 5 minutes
 
 ## Step 7: Seed Test Data (Optional)
 
@@ -165,7 +165,21 @@ If you set up Neon manually (not via Vercel integration):
 
 ### Cron Jobs
 
-The `vercel.json` file configures a cron job that runs every minute:
+The `vercel.json` file configures a cron job to process webhook events automatically.
+
+**Current Schedule: Every 5 minutes** (Free Tier Compatible)
+```json
+{
+  "crons": [
+    {
+      "path": "/api/jobs/ingest",
+      "schedule": "*/5 * * * *"
+    }
+  ]
+}
+```
+
+**For Production (Vercel Pro):** Change to run every minute for faster processing:
 ```json
 {
   "crons": [
@@ -177,7 +191,13 @@ The `vercel.json` file configures a cron job that runs every minute:
 }
 ```
 
-This processes queued webhook events automatically.
+**Cron Schedule Options:**
+- `*/5 * * * *` = Every 5 minutes (Free tier)
+- `* * * * *` = Every minute (Pro/Enterprise)
+- `*/15 * * * *` = Every 15 minutes
+- `0 * * * *` = Every hour
+
+**Note:** More frequent cron jobs may require a paid Vercel plan. The free tier works well with 5-minute intervals for testing.
 
 ### Security Headers
 
@@ -208,9 +228,10 @@ This is intentional - environment variables are validated at runtime.
 
 ### Cron Job Not Running
 
-1. Cron jobs require Vercel Pro plan for custom schedules
-2. Check Vercel logs: Project → Deployments → Function Logs
-3. Verify `CRON_SECRET` matches between env vars and worker auth
+1. Check Vercel logs: Project → Deployments → Function Logs
+2. Verify `CRON_SECRET` matches between env vars and worker auth
+3. Ensure the cron schedule is compatible with your Vercel plan (free tier works with 5+ minute intervals)
+4. Manually trigger the worker to test: `curl -X POST -H "Authorization: Bearer $CRON_SECRET" https://your-app.vercel.app/api/jobs/ingest`
 
 ### Local Development with Neon
 
